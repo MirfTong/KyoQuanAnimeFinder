@@ -1,4 +1,5 @@
 import io
+import json
 import unittest
 from email.message import Message
 from urllib.error import HTTPError
@@ -39,6 +40,72 @@ def http_error(url: str, status: int) -> HTTPError:
 
 
 class JikanClientTests(unittest.TestCase):
+    @staticmethod
+    def _get_page(client, kind):
+        if kind == "season":
+            return client.get_season_page(2026, "summer", page=2)
+        if kind == "anime":
+            return client.get_anime_catalogue_page(page=2)
+        return client.get_manga_catalogue_page(manga_type=kind, page=2)
+
+    def test_all_page_types_reject_invalid_records_without_discarding_them(self):
+        for kind in ("season", "anime", "manga", "manhwa"):
+            for invalid in (
+                None,
+                "missing",
+                {},
+                {"mal_id": True},
+                {"mal_id": 0},
+                {"mal_id": "2"},
+            ):
+                payload = json.dumps(
+                    {
+                        "data": [{"mal_id": 1}, invalid],
+                        "pagination": {"has_next_page": False, "current_page": 2},
+                    }
+                ).encode()
+                with self.subTest(kind=kind, invalid=invalid):
+                    client = JikanClient(
+                        opener=lambda request, *, timeout: Response(payload),
+                        fallback_base_url="",
+                    )
+                    with self.assertRaises(JikanTemporaryError):
+                        self._get_page(client, kind)
+
+    def test_all_page_types_reject_wrong_or_inconsistent_pagination(self):
+        for kind in ("season", "anime", "manga", "manhwa"):
+            for data, pagination in (
+                ([{"mal_id": 1}], {"has_next_page": True, "current_page": 1}),
+                ([{"mal_id": 1}], {"has_next_page": True, "current_page": True}),
+                ([], {"has_next_page": True, "current_page": 2}),
+                ([{"mal_id": 1}], {"has_next_page": True, "last_visible_page": 2}),
+                ([{"mal_id": 1}], {"has_next_page": False, "last_visible_page": 3}),
+            ):
+                payload = json.dumps({"data": data, "pagination": pagination}).encode()
+                with self.subTest(kind=kind, pagination=pagination):
+                    client = JikanClient(
+                        opener=lambda request, *, timeout: Response(payload),
+                        fallback_base_url="",
+                    )
+                    with self.assertRaises(JikanTemporaryError):
+                        self._get_page(client, kind)
+
+    def test_all_page_types_accept_sparse_records_and_empty_terminal_page(self):
+        for kind in ("season", "anime", "manga", "manhwa"):
+            for data in ([{"mal_id": 1}], []):
+                payload = json.dumps(
+                    {
+                        "data": data,
+                        "pagination": {"has_next_page": False, "current_page": 2},
+                    }
+                ).encode()
+                with self.subTest(kind=kind, data=data):
+                    client = JikanClient(
+                        opener=lambda request, *, timeout: Response(payload),
+                        fallback_base_url="",
+                    )
+                    self.assertEqual(self._get_page(client, kind).entries, data)
+
     def test_fetches_basic_anime_without_calling_full_endpoint(self):
         seen_urls = []
 
@@ -525,12 +592,8 @@ class JikanClientTests(unittest.TestCase):
             fallback_base_url="",
         )
 
-        manga_page = client.get_manga_catalogue_page(
-            manga_type=" Manga ", page=2
-        )
-        manhwa_page = client.get_manga_catalogue_page(
-            manga_type="MANHWA", page=3
-        )
+        manga_page = client.get_manga_catalogue_page(manga_type=" Manga ", page=2)
+        manhwa_page = client.get_manga_catalogue_page(manga_type="MANHWA", page=3)
 
         expected_page_two = JikanMangaPage(
             entries=[{"mal_id": 121}],
@@ -567,9 +630,7 @@ class JikanClientTests(unittest.TestCase):
         for page in (0, -1, True):
             with self.subTest(page=page):
                 with self.assertRaises(ValueError):
-                    client.get_manga_catalogue_page(
-                        manga_type="manga", page=page
-                    )
+                    client.get_manga_catalogue_page(manga_type="manga", page=page)
 
         invalid_envelopes = (
             b'{"data": null, "pagination": {"has_next_page": false}}',
@@ -603,9 +664,7 @@ class JikanClientTests(unittest.TestCase):
 
         def opener(request, *, timeout):
             requested_urls.append(request.full_url)
-            return Response(
-                b'{"data": [], "pagination": {"has_next_page": false}}'
-            )
+            return Response(b'{"data": [], "pagination": {"has_next_page": false}}')
 
         client = JikanClient(opener=opener)
 
@@ -623,9 +682,7 @@ class JikanClientTests(unittest.TestCase):
 
         def opener(request, *, timeout):
             requested_urls.append(request.full_url)
-            return Response(
-                b'{"data": [], "pagination": {"has_next_page": false}}'
-            )
+            return Response(b'{"data": [], "pagination": {"has_next_page": false}}')
 
         client = JikanClient(opener=opener)
 

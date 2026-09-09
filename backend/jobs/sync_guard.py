@@ -19,7 +19,10 @@ MAX_JOB_PAGES = 10
 
 
 def _github_datetime(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("GitHub timestamp must include a timezone")
+    return parsed.astimezone(timezone.utc)
 
 
 def should_run_scheduled_sync(
@@ -36,15 +39,19 @@ def should_run_scheduled_sync(
             or run.get("created_at")
             or run.get("etl_completed_at")
         )
-        if timestamp:
-            timestamps.append(_github_datetime(str(timestamp)))
+        if not isinstance(timestamp, str) or not timestamp:
+            raise ValueError("Verified ETL run had no timestamp")
+        timestamps.append(_github_datetime(timestamp))
     if not timestamps:
         return True, "No previous successful scheduled ETL run was found."
 
     last_success = max(timestamps)
     next_allowed = last_success + timedelta(hours=minimum_hours)
     if now >= next_allowed:
-        return True, f"The last successful scheduled ETL was {last_success.isoformat()}."
+        return (
+            True,
+            f"The last successful scheduled ETL was {last_success.isoformat()}.",
+        )
     return (
         False,
         "The last successful scheduled ETL was "
@@ -87,7 +94,7 @@ def _successful_scheduled_runs(
         f"{workflow_id}/runs?{query}",
         token=token,
     )
-    runs = payload.get("workflow_runs", [])
+    runs = payload.get("workflow_runs")
     total_count = payload.get("total_count")
     if (
         not isinstance(runs, list)
@@ -108,14 +115,12 @@ def _jobs_for_run(
     total_count: int | None = None
 
     for page in range(1, MAX_JOB_PAGES + 1):
-        query = urlencode(
-            {"filter": "all", "per_page": RESULTS_PER_PAGE, "page": page}
-        )
+        query = urlencode({"filter": "all", "per_page": RESULTS_PER_PAGE, "page": page})
         payload = _github_payload(
             f"{GITHUB_API_URL}/repos/{repository}/actions/runs/{run_id}/jobs?{query}",
             token=token,
         )
-        page_jobs = payload.get("jobs", [])
+        page_jobs = payload.get("jobs")
         page_total = payload.get("total_count")
         if (
             not isinstance(page_jobs, list)
@@ -141,6 +146,7 @@ def _jobs_for_run(
 
 def _successful_etl_completion(jobs: list[dict[str, object]]) -> datetime | None:
     completions: list[datetime] = []
+    identified_step = False
     for job in jobs:
         steps = job.get("steps")
         if not isinstance(steps, list):
@@ -148,7 +154,22 @@ def _successful_etl_completion(jobs: list[dict[str, object]]) -> datetime | None
         for step in steps:
             if not isinstance(step, dict):
                 raise RuntimeError("GitHub returned an invalid workflow step")
-            if step.get("name") != SYNC_STEP_NAME or step.get("conclusion") != "success":
+            if step.get("name") != SYNC_STEP_NAME:
+                continue
+            identified_step = True
+            conclusion = step.get("conclusion")
+            if conclusion not in {
+                "success",
+                "skipped",
+                "failure",
+                "cancelled",
+                "timed_out",
+                "neutral",
+            }:
+                raise RuntimeError(
+                    "GitHub returned an ETL step without a final conclusion"
+                )
+            if conclusion != "success":
                 continue
             completed_at = step.get("completed_at")
             if not isinstance(completed_at, str) or not completed_at:
@@ -159,6 +180,8 @@ def _successful_etl_completion(jobs: list[dict[str, object]]) -> datetime | None
                 raise RuntimeError(
                     "Successful ETL step had an invalid completion timestamp"
                 ) from error
+    if not identified_step:
+        raise RuntimeError("GitHub jobs did not identify the expected ETL step")
     return max(completions) if completions else None
 
 
@@ -179,7 +202,9 @@ def _successful_scheduled_etl_runs(
         if expected_total is None:
             expected_total = total_count
         elif total_count != expected_total:
-            raise RuntimeError("GitHub workflow-run pagination changed during verification")
+            raise RuntimeError(
+                "GitHub workflow-run pagination changed during verification"
+            )
 
         verified: list[dict[str, object]] = []
         for run in runs:
@@ -265,6 +290,11 @@ def main() -> None:
                 workflow=args.workflow,
                 token=token,
             )
+            should_run, reason = should_run_scheduled_sync(
+                runs,
+                now=datetime.now(timezone.utc),
+                minimum_hours=args.minimum_hours,
+            )
         except Exception as error:
             reason = (
                 "Unable to verify the previous successful workflow run; "
@@ -274,11 +304,6 @@ def main() -> None:
             _write_output("should_run", "false")
             _write_summary(False, reason)
             raise SystemExit(reason) from None
-        should_run, reason = should_run_scheduled_sync(
-            runs,
-            now=datetime.now(timezone.utc),
-            minimum_hours=args.minimum_hours,
-        )
     else:
         should_run = True
         reason = f"Event {event_name or 'unknown'} is not a scheduled run."

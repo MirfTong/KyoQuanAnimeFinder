@@ -249,7 +249,8 @@ class JikanEtlTests(unittest.TestCase):
                 stats,
             )
 
-        self.assertEqual(mock_db.session.delete.call_count, 2)
+        mock_db.session.delete.assert_called_once_with(studio_link)
+        self.assertEqual(anime.streaming_links, [])
         self.assertEqual(stats.studio_links_removed, 1)
         self.assertEqual(stats.streaming_links_removed, 1)
         self.assertEqual(stats.anime_with_studios_updated, 1)

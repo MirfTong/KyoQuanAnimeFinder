@@ -50,6 +50,8 @@ class SyncMetrics:
     unchanged: int = 0
     removed: int = 0
     failed: int = 0
+    records_succeeded: int = 0
+    failure_reasons: dict = field(default_factory=dict)
     deferred: int = 0
     pages_applied: int = 0
     pages_failed: int = 0
@@ -226,6 +228,42 @@ def _usable_streaming(data):
     return parsed is not None and parsed[2]
 
 
+def _complete_detail(kind, data):
+    """A partial response may improve metadata without completing a refresh.
+
+    Streaming has its own queue: its absence from a normal detail response does
+    not invalidate the other metadata. Optional scalars (score, dates, etc.) may
+    legitimately be null. Core fields and relationship arrays must be usable.
+    """
+    from backend.jobs.jikan_etl import _studio_values
+    from backend.jobs.manga_etl import _author_values
+
+    if not data or data.get("_etl_basic_fallback"):
+        return False
+    if any(
+        not isinstance(data.get(key), str) or not data[key].strip()
+        for key in ("title", "status")
+    ):
+        return False
+    for key in ("genres", "explicit_genres", "themes", "demographics"):
+        if key != "genres" and key not in data:
+            continue
+        entries = data.get(key)
+        if not isinstance(entries, list) or any(
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("name"), str)
+            or not entry["name"].strip()
+            for entry in entries
+        ):
+            return False
+    parsed = (
+        _studio_values(data.get("studios"))
+        if kind == "anime"
+        else _author_values(data.get("authors"))
+    )
+    return parsed is not None and parsed[2]
+
+
 def fetch_work(client, budget, page_plans, queues, spool, metrics):
     """Round-robin each lane; unused shares are deliberately not borrowed."""
     lanes = deque()
@@ -334,7 +372,7 @@ def record_attempt(item, data, failure, now, policy):
         parsed = _streaming_values(data.get("streaming")) if data else None
         if parsed is None or not parsed[2]:
             failure = "incomplete_streaming"
-    elif failure is None and data and data.get("_etl_basic_fallback"):
+    elif failure is None and not _complete_detail(item["kind"], data):
         failure = "incomplete_detail"
     state.last_attempt_at = now
     state.last_failure = failure
@@ -518,9 +556,17 @@ def apply_details(items, now, policy, metrics):
                             row.last_jikan_sync = now if changed else old_sync
                     elif failure:
                         batch.failed += 1
-                    recorded_failure = record_attempt(item, data, failure, now, policy)
+                    recorded_failure = record_attempt(
+                        item, item["data"], failure, now, policy
+                    )
                     if recorded_failure and not failure:
                         batch.failed += 1
+                    if recorded_failure:
+                        batch.failure_reasons[recorded_failure] = (
+                            batch.failure_reasons.get(recorded_failure, 0) + 1
+                        )
+                    elif row is not None:
+                        batch.records_succeeded += 1
                     if (
                         item["kind"] == "anime"
                         and item["queue"] == "detail"
@@ -531,8 +577,18 @@ def apply_details(items, now, policy, metrics):
                             {**item, "queue": "streaming"}, data, None, now, policy
                         )
             db.session.commit()
-            for key in ("changed", "unchanged", "removed", "failed"):
+            for key in (
+                "changed",
+                "unchanged",
+                "removed",
+                "failed",
+                "records_succeeded",
+            ):
                 setattr(metrics, key, getattr(metrics, key) + getattr(batch, key))
+            for reason, count in batch.failure_reasons.items():
+                metrics.failure_reasons[reason] = (
+                    metrics.failure_reasons.get(reason, 0) + count
+                )
         except BaseException:
             db.session.rollback()
             raise
@@ -553,6 +609,8 @@ def apply_page(item, metrics):
         )
         anime._record_page_error(item["key"], page, RuntimeError(item["failure"]))
         metrics.pages_failed += 1
+        reason = "page_" + item["failure"]
+        metrics.failure_reasons[reason] = metrics.failure_reasons.get(reason, 0) + 1
         metrics.cursors[item["key"]] = page
         return
     result = item["result"]
@@ -698,12 +756,16 @@ def run(
         metrics.removed += anime.remove_hentai_anime() + manga.remove_adult_manga()
         if metrics.changed or metrics.removed:
             anime._refresh_and_report_catalogue_facets()
-        if metrics.failed or metrics.pages_failed:
+        recoverable_failures = metrics.failed or metrics.pages_failed
+        verified_progress = metrics.pages_applied or metrics.records_succeeded
+        if not verified_progress and (recoverable_failures or budget.failed):
             raise RuntimeError(
-                "Some ETL requests failed; committed progress is retained for retry"
+                "ETL requests failed without verified progress; committed retry state is retained"
             )
         outcome = (
-            "bounded_success"
+            "success_with_warnings"
+            if recoverable_failures
+            else "bounded_success"
             if budget.exhausted
             or metrics.deferred
             or metrics.provider_caps
