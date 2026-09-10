@@ -53,6 +53,17 @@ def item(mal_id=1, kind="anime", queue="detail", data=None, failure=None):
     return dict(kind=kind, queue=queue, mal_id=mal_id, data=data, failure=failure)
 
 
+def full_detail(mal_id=1, **kwargs):
+    return dict(
+        mal_id=mal_id,
+        title="Example",
+        status="Finished Airing",
+        genres=[],
+        studios=[],
+        **kwargs,
+    )
+
+
 class PolicyTests(unittest.TestCase):
     def test_status_and_actual_end_date_determine_freshness(self):
         policy = RefreshPolicy()
@@ -432,7 +443,9 @@ class PersistenceTests(unittest.TestCase):
         )
         self.assertEqual([link.genre.name for link in row.genre_links], ["Drama"])
         state = self.session.get(JikanRefreshState, ("manhwa", 10, "detail"))
-        self.assertEqual(utc(state.next_attempt_at), NOW + timedelta(days=3))
+        self.assertEqual(utc(state.next_attempt_at), NOW + timedelta(days=1))
+        self.assertEqual(state.last_failure, "incomplete_detail")
+        self.assertIsNone(state.last_success_at)
 
     def test_streaming_projection_omits_synopsis(self):
         self.anime()
@@ -489,6 +502,59 @@ class PersistenceTests(unittest.TestCase):
             self.session.get(JikanRefreshState, ("anime", 1, "detail"))
         )
 
+    def test_committed_progress_with_recoverable_items_does_not_fail_cadence(self):
+        """Sept 8/9 live runs committed pages, then failed on ordinary item errors."""
+        self.anime()
+
+        def fetch(client, budget, pages, work, spool, metrics):
+            spool.write(
+                json.dumps(
+                    {
+                        "kind": "anime_page",
+                        "key": jikan_etl.BULK_SEASON_STATE_KEY,
+                        "provider_type": "tv",
+                        "page": 4,
+                        "result": {
+                            "entries": [
+                                {"mal_id": 1, "title": "Updated", "type": "TV"}
+                            ],
+                            "page": 4,
+                            "has_next_page": True,
+                        },
+                    }
+                )
+                + "\n"
+            )
+            for mal_id, failure in enumerate(
+                ("not_found", "temporary", "invalid_payload"), 1
+            ):
+                spool.write(
+                    json.dumps(item(mal_id, queue="streaming", failure=failure)) + "\n"
+                )
+
+        with (
+            patch.object(worker, "fetch_work", side_effect=fetch),
+            patch.object(jikan_etl, "_ensure_schema"),
+            patch.object(jikan_etl, "remove_hentai_anime", return_value=0),
+            patch.object(manga_etl, "remove_adult_manga", return_value=0),
+            patch.object(jikan_etl, "_refresh_and_report_catalogue_facets"),
+            patch.object(self.engine, "dispose"),
+            patch.object(worker, "report") as report,
+        ):
+            result = worker.run()
+        self.assertEqual(report.call_args.args[2], "success_with_warnings")
+        self.assertEqual(result.pages_applied, 1)
+        self.assertEqual(result.failed, 3)
+        self.assertEqual(
+            result.failure_reasons,
+            {"not_found": 1, "temporary": 1, "invalid_payload": 1},
+        )
+        self.assertEqual(self.session.scalar(select(Anime.title)), "Updated")
+        self.assertEqual(
+            self.session.get(JikanSyncState, jikan_etl.BULK_SEASON_STATE_KEY).next_page,
+            5,
+        )
+
     def test_budget_stop_is_successful_without_marking_deferred_titles_attempted(self):
         self.anime()
 
@@ -507,6 +573,50 @@ class PersistenceTests(unittest.TestCase):
             worker.run()
         self.assertEqual(report.call_args.args[2], "bounded_success")
         self.assertIsNone(self.session.get(JikanRefreshState, ("anime", 1, "detail")))
+
+    def test_total_outage_exhausting_budget_is_not_a_success(self):
+        self.anime()
+
+        def fetch(client, budget, pages, work, spool, metrics):
+            budget.exhausted.add("anime")
+            budget.attempted = budget.failed = 40
+
+        with (
+            patch.object(worker, "fetch_work", side_effect=fetch),
+            patch.object(jikan_etl, "_ensure_schema"),
+            patch.object(jikan_etl, "remove_hentai_anime", return_value=0),
+            patch.object(manga_etl, "remove_adult_manga", return_value=0),
+            patch.object(self.engine, "dispose"),
+            patch.object(worker, "report") as report,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "without verified progress"):
+                worker.run()
+        self.assertEqual(report.call_args.args[2], "failed")
+        self.assertIsNone(self.session.get(JikanRefreshState, ("anime", 1, "detail")))
+
+    def test_sparse_full_payload_does_not_claim_detail_success(self):
+        row = self.anime()
+        worker.apply_details(
+            [item(data={"mal_id": 1})], NOW, RefreshPolicy(), self.metrics
+        )
+        state = self.session.get(JikanRefreshState, ("anime", 1, "detail"))
+        self.assertIsNone(state.last_success_at)
+        self.assertEqual(state.last_failure, "incomplete_detail")
+        self.assertEqual(row.title, "Example")
+        self.assertEqual(self.metrics.records_succeeded, 0)
+
+    def test_complete_detail_without_streaming_completes_only_detail_queue(self):
+        self.anime()
+        worker.apply_details(
+            [item(data=full_detail())], NOW, RefreshPolicy(), self.metrics
+        )
+        state = self.session.get(JikanRefreshState, ("anime", 1, "detail"))
+        self.assertEqual(utc(state.last_success_at), NOW)
+        self.assertIsNone(state.last_failure)
+        self.assertEqual(self.metrics.records_succeeded, 1)
+        self.assertIsNone(
+            self.session.get(JikanRefreshState, ("anime", 1, "streaming"))
+        )
 
     def test_empty_streaming_backoff_persists_and_filters_queue(self):
         self.anime()
@@ -665,7 +775,9 @@ class PersistenceTests(unittest.TestCase):
         def fetch(client, budget, pages, work, spool, metrics):
             self.assertFalse(self.session.registry.has())
             budget.attempted = budget.successful = 1
-            spool.write(json.dumps(item(data={"mal_id": 1, "title": "Updated"})) + "\n")
+            spool.write(
+                json.dumps(item(data={**full_detail(), "title": "Updated"})) + "\n"
+            )
 
         with (
             patch.object(worker, "fetch_work", side_effect=fetch),

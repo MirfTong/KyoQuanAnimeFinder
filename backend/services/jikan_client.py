@@ -147,7 +147,11 @@ class JikanClient:
             ):
                 raise
             payload = self.get_anime(mal_id)
-            return {**payload, "_etl_basic_fallback": True} if self.budget is not None else payload
+            return (
+                {**payload, "_etl_basic_fallback": True}
+                if self.budget is not None
+                else payload
+            )
 
     def get_anime_streaming(self, mal_id: int) -> dict[str, Any]:
         """Fetch streaming metadata directly from its configured provider.
@@ -190,7 +194,11 @@ class JikanClient:
             ):
                 raise
             payload = self.get_manga(mal_id)
-            return {**payload, "_etl_basic_fallback": True} if self.budget is not None else payload
+            return (
+                {**payload, "_etl_basic_fallback": True}
+                if self.budget is not None
+                else payload
+            )
 
     def get_manga(self, mal_id: int) -> dict[str, Any]:
         """Return basic manga data with one bounded 5xx/network retry."""
@@ -220,9 +228,11 @@ class JikanClient:
             max_transient_retries=MAX_SEASON_TRANSIENT_RETRIES,
             retry_network_errors=True,
         )
-        data, pagination = self._page_data(payload, description="seasonal response")
+        data, pagination = self._page_data(
+            payload, description="seasonal response", expected_page=page
+        )
         return JikanSeasonPage(
-            entries=[entry for entry in data if isinstance(entry, dict)],
+            entries=data,
             page=page,
             has_next_page=pagination["has_next_page"],
         )
@@ -252,19 +262,11 @@ class JikanClient:
             retry_network_errors=True,
         )
         data, pagination = self._page_data(
-            payload, description="anime catalogue response"
+            payload, description="anime catalogue response", expected_page=page
         )
         last_visible_page = pagination.get("last_visible_page")
-        if last_visible_page is not None and (
-            isinstance(last_visible_page, bool)
-            or not isinstance(last_visible_page, int)
-            or last_visible_page <= 0
-        ):
-            raise JikanTemporaryError(
-                "Anime API anime catalogue response had invalid pagination"
-            )
         return JikanAnimePage(
-            entries=[entry for entry in data if isinstance(entry, dict)],
+            entries=data,
             page=page,
             has_next_page=pagination["has_next_page"],
             last_visible_page=last_visible_page,
@@ -285,43 +287,12 @@ class JikanClient:
             retry_network_errors=True,
         )
         data, pagination = self._page_data(
-            payload, description="manga catalogue response"
+            payload, description="manga catalogue response", expected_page=page
         )
-        current_page = pagination.get("current_page")
-        if current_page is not None and (
-            isinstance(current_page, bool)
-            or not isinstance(current_page, int)
-            or current_page != page
-        ):
-            raise JikanTemporaryError(
-                "Anime API manga catalogue returned the wrong page"
-            )
         last_visible_page = pagination.get("last_visible_page")
-        if last_visible_page is not None and (
-            isinstance(last_visible_page, bool)
-            or not isinstance(last_visible_page, int)
-            or last_visible_page <= 0
-        ):
-            raise JikanTemporaryError(
-                "Anime API manga catalogue response had invalid pagination"
-            )
-        entries = [entry for entry in data if isinstance(entry, dict)]
         has_next_page = pagination["has_next_page"]
-        if has_next_page and not entries:
-            raise JikanTemporaryError(
-                "Anime API manga catalogue returned an empty nonterminal page"
-            )
-        if last_visible_page is not None:
-            if has_next_page and page >= last_visible_page:
-                raise JikanTemporaryError(
-                    "Anime API manga catalogue pagination was inconsistent"
-                )
-            if not has_next_page and entries and page != last_visible_page:
-                raise JikanTemporaryError(
-                    "Anime API manga catalogue terminal page was inconsistent"
-                )
         return JikanMangaPage(
-            entries=entries,
+            entries=data,
             page=page,
             has_next_page=has_next_page,
             last_visible_page=last_visible_page,
@@ -402,7 +373,9 @@ class JikanClient:
     ) -> dict[str, Any]:
         """Fetch JSON with independent 429 and bounded transient retry budgets."""
         url = f"{base_url}{path}"
-        cached = self.response_cache.get(url) if self.response_cache is not None else None
+        cached = (
+            self.response_cache.get(url) if self.response_cache is not None else None
+        )
         if cached is not None:
             if self.budget is not None:
                 self.budget.avoided += 1
@@ -477,8 +450,8 @@ class JikanClient:
 
     @staticmethod
     def _page_data(
-        payload: dict[str, Any], *, description: str
-    ) -> tuple[list[Any], dict[str, Any]]:
+        payload: dict[str, Any], *, description: str, expected_page: int
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Validate a page envelope before an ETL cursor can advance."""
         data = payload.get("data")
         pagination = payload.get("pagination")
@@ -488,6 +461,46 @@ class JikanClient:
             pagination.get("has_next_page"), bool
         ):
             raise JikanTemporaryError(f"Anime API {description} had invalid pagination")
+        # Reject the whole page rather than dropping invalid entries and advancing
+        # the durable cursor past titles that have never been applied.
+        if any(
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("mal_id"), int)
+            or isinstance(entry["mal_id"], bool)
+            or entry["mal_id"] <= 0
+            for entry in data
+        ):
+            raise JikanTemporaryError(f"Anime API {description} had an invalid record")
+        current_page = pagination.get("current_page")
+        if current_page is not None and (
+            isinstance(current_page, bool)
+            or not isinstance(current_page, int)
+            or current_page != expected_page
+        ):
+            raise JikanTemporaryError(
+                f"Anime API {description} returned the wrong page"
+            )
+        has_next_page = pagination["has_next_page"]
+        if has_next_page and not data:
+            raise JikanTemporaryError(
+                f"Anime API {description} returned an empty nonterminal page"
+            )
+        last_visible_page = pagination.get("last_visible_page")
+        if last_visible_page is not None:
+            if (
+                isinstance(last_visible_page, bool)
+                or not isinstance(last_visible_page, int)
+                or last_visible_page <= 0
+            ):
+                raise JikanTemporaryError(
+                    f"Anime API {description} had invalid pagination"
+                )
+            if (has_next_page and expected_page >= last_visible_page) or (
+                not has_next_page and data and expected_page != last_visible_page
+            ):
+                raise JikanTemporaryError(
+                    f"Anime API {description} pagination was inconsistent"
+                )
         return data, pagination
 
     def _primary_cooldown_is_active(self) -> bool:
@@ -645,15 +658,9 @@ def get_anime_catalogue_page(
     *, anime_type: str = "tv", page: int = 1
 ) -> JikanAnimePage:
     """Return one parsed page from Jikan's bulk anime catalogue."""
-    return _default_client.get_anime_catalogue_page(
-        anime_type=anime_type, page=page
-    )
+    return _default_client.get_anime_catalogue_page(anime_type=anime_type, page=page)
 
 
-def get_manga_catalogue_page(
-    *, manga_type: str, page: int = 1
-) -> JikanMangaPage:
+def get_manga_catalogue_page(*, manga_type: str, page: int = 1) -> JikanMangaPage:
     """Return one parsed safe-for-work manga catalogue page."""
-    return _default_client.get_manga_catalogue_page(
-        manga_type=manga_type, page=page
-    )
+    return _default_client.get_manga_catalogue_page(manga_type=manga_type, page=page)

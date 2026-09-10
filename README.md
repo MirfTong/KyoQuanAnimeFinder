@@ -325,10 +325,21 @@ performed to meet a storage quota. Facets are published only after changes.
 
 A fully applied budget-limited run is successful even when work remains, and
 counts toward the 72-hour cadence. Deferred/unfetched titles are not marked
-attempted. Provider failures or incomplete responses make the run fail after
-saving valid progress and retry state. Database failures roll back the current
-transaction; earlier committed pages/batches remain resumable. Interruptions
-during fetching leave planned work pending, and the next run may fetch it again.
+attempted. When at least one verified page or complete record is committed,
+routine item failures (404s, exhausted temporary retries, sparse responses) and
+failed pages produce `success_with_warnings`, not a failed workflow. This counts
+toward the same 72-hour interval, preventing one unavailable title from causing
+another full ETL every day. Failed items retain retry state; failed pages do not
+advance. Partial detail payloads may safely improve metadata, but do not mark
+detail freshness successful: title/status, genres and studios (Anime) or authors
+(Manga/Manhwa) must be usable. Streaming completeness is tracked separately.
+
+An outage with no verified progress remains fatal, including when unsuccessful
+HTTP attempts exhaust the budget. Unexpected exceptions and database/schema
+errors also fail the run. Database failures roll back the current transaction;
+earlier committed pages/batches remain resumable. Fatal runs do not reset the
+cadence, so the next daily check may retry. Interruptions during fetching leave
+planned work pending, and the next run may fetch it again.
 
 Useful focused commands are:
 
@@ -364,7 +375,9 @@ workflow caches only pip dependencies, keyed by requirements.txt. The step
 summary and `ETL efficiency` JSON log report HTTP attempts, successes, failures,
 requests avoided, selected/changed/unchanged/failed/deferred records, adult-only
 removals, applied/failed pages, cursor positions, fetch/apply seconds, and exhausted
-budget categories. Record counters are phase operations, not unique title counts;
+budget categories. `records_succeeded` counts complete record refreshes, and
+`failure_reasons` separates missing, temporary, invalid and incomplete responses.
+Record counters are phase operations, not unique title counts;
 deferred counts cover due detail/streaming queues, while page progress is shown
 by cursor. HTTP success means a parsed response, not necessarily valid title data.
 
@@ -402,12 +415,26 @@ a frontend build. For isolated ETL validation, set `DATABASE_URL=sqlite://` in
 the test process and run:
 
 ```powershell
-python -m unittest tests.test_efficient_sync tests.test_jikan_client tests.test_jikan_etl tests.test_manga_etl tests.test_sync_guard tests.test_workflow tests.test_models tests.test_database_maintenance
+python -m unittest tests.test_efficient_sync tests.test_etl_relationship_recovery tests.test_jikan_client tests.test_jikan_etl tests.test_manga_etl tests.test_sync_guard tests.test_workflow tests.test_models tests.test_database_maintenance
 ```
 
-These tests use mocked providers and isolated SQLite transactions (with JSON
-standing in for PostgreSQL arrays), plus PostgreSQL model/schema checks. They
-do not connect to Neon or run a live ETL.
+These unit tests use mocked providers and isolated SQLite transactions (with
+JSON standing in for PostgreSQL arrays), plus model/schema assertions. Those
+assertions alone do not validate PostgreSQL persistence or migrations.
+
+Run the PostgreSQL integration suite against a disposable **local** database:
+
+```powershell
+$env:DATABASE_URL = 'sqlite://'
+$env:ETL_TEST_DATABASE_URL = 'postgresql+psycopg2://etl_test@127.0.0.1:55437/kyoquan_etl_test'
+python -m unittest tests.test_etl_postgres
+```
+
+The integration suite uses isolated test schemas, real PostgreSQL migrations
+and transactions, and mocked HTTP responses. It covers fresh installation,
+version-6 upgrade preserving catalogue/cursors, scheduled-entrypoint recovery,
+and duplicate-safe relationship updates. It never needs Neon or a live ETL.
+Without `ETL_TEST_DATABASE_URL`, PostgreSQL integration checks are skipped.
 
 Run the frontend production-build validation:
 

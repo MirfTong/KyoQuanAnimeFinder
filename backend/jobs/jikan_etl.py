@@ -727,7 +727,17 @@ def _reconcile_streaming_services(
     if complete:
         for normalized_name, link in links_by_name.items():
             if normalized_name not in desired_names:
-                db.session.delete(link)
+                # Detail and dedicated streaming payloads can reconcile the
+                # same title before this batch is flushed. Collection removal
+                # lets delete-orphan handle both persisted and pending links;
+                # Session.delete rejects links just added by a partial payload.
+                pending = sa_inspect(link).pending
+                anime.streaming_links.remove(link)
+                if pending:
+                    # The orphan was expunged before ever reaching the DB.
+                    # Also unlink its inverse so a later flush cannot try to
+                    # cascade-add it again through the service's collection.
+                    link.streaming_service = None
                 stats.streaming_links_removed += 1
                 changed = True
     if changed:
@@ -737,8 +747,8 @@ def _reconcile_streaming_services(
 def _detailed_genres(data: dict[str, Any], current: list[str]) -> list[str]:
     """Add Jikan genre classifications without discarding richer CSV tags."""
     jikan_names = []
-    for field in ("genres", "explicit_genres", "themes", "demographics"):
-        jikan_names.extend(name.lower() for name in _names(data.get(field)))
+    for field_name in ("genres", "explicit_genres", "themes", "demographics"):
+        jikan_names.extend(name.lower() for name in _names(data.get(field_name)))
     return list(dict.fromkeys([*current, *jikan_names]))
 
 
