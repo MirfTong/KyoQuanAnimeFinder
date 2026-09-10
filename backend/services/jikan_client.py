@@ -404,13 +404,13 @@ class JikanClient:
                             f"Anime API returned a non-object response: {path}"
                         )
                     if self.budget is not None:
-                        self.budget.successful += 1
+                        self.budget.record_success()
                     if self.response_cache is not None:
                         self.response_cache.put(url, payload)
                     return payload
             except HTTPError as error:
                 if self.budget is not None:
-                    self.budget.failed += 1
+                    self.budget.record_failure()
                 if error.code == 429 and rate_retries < MAX_429_RETRIES:
                     delay = self._retry_delay(error, rate_retries)
                     rate_retries += 1
@@ -431,7 +431,7 @@ class JikanClient:
                 raise
             except (TimeoutError, URLError) as error:
                 if self.budget is not None:
-                    self.budget.failed += 1
+                    self.budget.record_failure()
                 if (
                     retry_network_errors
                     and transient_retries < max_transient_retries
@@ -445,7 +445,7 @@ class JikanClient:
                 ) from error
             except JikanTemporaryError:
                 if self.budget is not None:
-                    self.budget.failed += 1
+                    self.budget.record_failure()
                 raise
 
     @staticmethod

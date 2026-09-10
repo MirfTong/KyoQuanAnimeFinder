@@ -54,6 +54,7 @@ class RelationshipRecoveryTests(PersistenceFixture, unittest.TestCase):
             ),
             0,
         )
+        self.assertEqual(self.metrics.relationships_changed, 2)
 
     def test_complete_streaming_replaces_partial_links_and_rerun_is_duplicate_safe(
         self,

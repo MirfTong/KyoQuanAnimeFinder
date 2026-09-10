@@ -7,6 +7,14 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import inspect
 
 
+ACTIVE_STATUSES = frozenset({"CURRENTLY_AIRING", "AIRING", "PUBLISHING"})
+UPCOMING_STATUSES = frozenset(
+    {"NOT_YET_AIRED", "NOT_YET_AIRING", "NOT_YET_PUBLISHED", "UPCOMING"}
+)
+FINISHED_STATUSES = frozenset({"FINISHED", "FINISHED_AIRING"})
+DETAIL_TIERS = ("active", "recent", "stable", "archived")
+
+
 def utc(value: datetime) -> datetime:
     return (
         value.replace(tzinfo=timezone.utc)
@@ -18,14 +26,31 @@ def utc(value: datetime) -> datetime:
 @dataclass(frozen=True)
 class RefreshPolicy:
     airing_days: int = 3
-    recent_days: int = 7
-    stable_days: int = 60
+    recent_days: int = 14
+    stable_days: int = 90
+    archived_days: int = 180
     retry_days: int = 1
-    discovery_days: int = 14
+    retry_max_days: int = 14
+    discovery_days: int = 30
+    recent_window_days: int = 180
+    archived_after_days: int = 1825
 
     def __post_init__(self):
         if any(getattr(self, field) <= 0 for field in self.__dataclass_fields__):
             raise ValueError("Refresh intervals must be positive")
+        if not (
+            self.airing_days
+            <= self.recent_days
+            <= self.stable_days
+            <= self.archived_days
+        ):
+            raise ValueError(
+                "Refresh tier intervals must be ordered shortest to longest"
+            )
+        if self.retry_days > self.retry_max_days:
+            raise ValueError("Retry maximum must not be shorter than its initial delay")
+        if self.recent_window_days >= self.archived_after_days:
+            raise ValueError("Recent window must end before the archive threshold")
 
     @classmethod
     def from_env(cls):
@@ -36,29 +61,76 @@ class RefreshPolicy:
             }
         )
 
-    def detail_days(self, data: dict, now: datetime) -> int:
-        status = str(data.get("status") or "").strip().upper().replace(" ", "_")
-        if status in {"CURRENTLY_AIRING", "AIRING", "PUBLISHING"}:
-            return self.airing_days
-        if status not in {"FINISHED", "FINISHED_AIRING"}:
-            return self.recent_days
+    @staticmethod
+    def normalized_status(value) -> str:
+        return str(value or "").strip().upper().replace(" ", "_")
+
+    def detail_tier(self, data: dict, now: datetime) -> str:
+        """Classify complete detail data by its likelihood of changing."""
+        status = self.normalized_status(data.get("status"))
+        if status in ACTIVE_STATUSES | UPCOMING_STATUSES:
+            return "active"
+        if status not in FINISHED_STATUSES:
+            return "recent"
         dates = data.get("aired") or data.get("published")
         end = dates.get("to") if isinstance(dates, dict) else None
         try:
             ended = utc(datetime.fromisoformat(end.replace("Z", "+00:00")))
-        except AttributeError, TypeError, ValueError:
-            # A start/publication year does not prove when a long-running title ended.
-            return self.recent_days
-        return (
-            self.recent_days if now - ended < timedelta(days=90) else self.stable_days
-        )
+        except (AttributeError, TypeError, ValueError):
+            # A finished title with no trustworthy end date is unlikely to need
+            # the same cadence as an airing title, but remains in normal rotation.
+            return "stable"
+        age = now - ended
+        if age < timedelta(days=self.recent_window_days):
+            return "recent"
+        if age >= timedelta(days=self.archived_after_days):
+            return "archived"
+        return "stable"
+
+    def tier_days(self, tier: str) -> int:
+        if tier not in DETAIL_TIERS:
+            raise ValueError(f"Unknown refresh tier: {tier}")
+        return {
+            "active": self.airing_days,
+            "recent": self.recent_days,
+            "stable": self.stable_days,
+            "archived": self.archived_days,
+        }[tier]
+
+    def detail_days(self, data: dict, now: datetime) -> int:
+        return self.tier_days(self.detail_tier(data, now))
+
+    def retry_delay(self, failure: str, failure_streak: int) -> int:
+        """Return bounded exponential backoff for a repeated item failure."""
+        streak = max(1, failure_streak)
+        base = 30 if failure == "not_found" else self.retry_days
+        maximum = self.archived_days if failure == "not_found" else self.retry_max_days
+        return min(maximum, base * (2 ** min(streak - 1, 10)))
+
+    def next_eligible_estimates(self, now: datetime) -> dict[str, str]:
+        days = {tier: self.tier_days(tier) for tier in DETAIL_TIERS} | {
+            "retry": self.retry_days,
+            "discovery": self.discovery_days,
+        }
+        return {
+            tier: (now + timedelta(days=interval)).isoformat()
+            for tier, interval in days.items()
+        }
 
 
 def next_streaming_check(
-    streak: int, *, empty: bool, failed: bool, now: datetime, policy: RefreshPolicy
+    streak: int,
+    *,
+    empty: bool,
+    failed: bool,
+    now: datetime,
+    policy: RefreshPolicy,
+    failure_streak: int = 1,
 ):
     if failed:
-        return streak, now + timedelta(days=policy.retry_days)
+        return streak, now + timedelta(
+            days=policy.retry_delay("temporary", failure_streak)
+        )
     if empty:
         streak = min(streak + 1, 3)
         return streak, now + timedelta(days=(7, 30, 90)[streak - 1])

@@ -410,6 +410,10 @@ class JikanRefreshState(db.Model):
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     empty_streak: Mapped[int] = mapped_column(default=0, server_default="0")
     last_failure: Mapped[str | None] = mapped_column(String(30))
+    # Persist the provider-derived tier because a start year alone cannot tell
+    # whether a long-running title completed recently.
+    refresh_tier: Mapped[str | None] = mapped_column(String(12))
+    failure_streak: Mapped[int] = mapped_column(default=0, server_default="0")
 
 
 class JikanSyncState(db.Model):

@@ -150,13 +150,15 @@ class PostgreSQLETLTests(unittest.TestCase):
             self.session.scalar(
                 text("SELECT max(version) FROM catalogue_schema_version")
             ),
-            7,
+            8,
         )
         columns = {
             column["name"]: column
             for column in inspect(self.engine).get_columns("jikan_refresh_state")
         }
         self.assertTrue(columns["last_success_at"]["type"].timezone)
+        self.assertIn("refresh_tier", columns)
+        self.assertIn("failure_streak", columns)
         self.assertIn(
             "ix_jikan_refresh_due",
             {
@@ -229,10 +231,61 @@ class PostgreSQLETLTests(unittest.TestCase):
                     )
                 )
             ),
-            [6, 7],
+            [6, 8],
         )
         self.assertEqual(
             self.session.scalar(text("SELECT count(*) FROM jikan_refresh_state")), 0
+        )
+
+    def test_version_seven_upgrade_preserves_refresh_state_catalogue_and_cursor(self):
+        with patch.object(schema, "CATALOGUE_SCHEMA_VERSION", 7):
+            self.migrate()
+        self.session.execute(
+            text("ALTER TABLE jikan_refresh_state DROP COLUMN refresh_tier")
+        )
+        self.session.execute(
+            text("ALTER TABLE jikan_refresh_state DROP COLUMN failure_streak")
+        )
+        row = self.anime(last_jikan_sync=NOW)
+        self.session.add(
+            JikanSyncState(
+                key="bulk:catalogue:tv:v3",
+                next_page=17,
+                last_attempt_at=NOW,
+            )
+        )
+        self.session.flush()
+        self.session.execute(
+            text(
+                "INSERT INTO jikan_refresh_state "
+                "(kind, mal_id, queue, last_attempt_at, last_success_at, "
+                "next_attempt_at, empty_streak, last_failure) VALUES "
+                "('anime', :mal_id, 'detail', :now, :now, :now, 0, NULL)"
+            ),
+            {"mal_id": row.mal_id, "now": NOW},
+        )
+        self.session.commit()
+
+        self.migrate()
+        self.session.expire_all()
+        state = self.session.get(JikanRefreshState, ("anime", row.mal_id, "detail"))
+        self.assertEqual(state.last_success_at, NOW)
+        self.assertIsNone(state.refresh_tier)
+        self.assertEqual(state.failure_streak, 0)
+        self.assertEqual(
+            self.session.get(JikanSyncState, "bulk:catalogue:tv:v3").next_page,
+            17,
+        )
+        self.assertEqual(self.session.get(Anime, row.animeID).title, "Existing")
+        self.assertEqual(
+            list(
+                self.session.scalars(
+                    text(
+                        "SELECT version FROM catalogue_schema_version ORDER BY version"
+                    )
+                )
+            ),
+            [7, 8],
         )
 
     def client_factory(self, responder, requests):

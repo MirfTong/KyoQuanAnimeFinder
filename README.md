@@ -271,40 +271,52 @@ records are handled than selected.
 
 Existing `jikan_sync_state` keys and progress are retained. Pages commit their
 catalogue changes and next cursor atomically. A failed page is retried on a later
-run; completed bulk scans wrap to page 1 but wait 14 days before beginning a new
+run; completed bulk scans wrap to page 1 but wait 30 days before beginning a new
 pass. Completed seasonal scans wait three days. Partial scans remain eligible,
 and the oldest-attempted discovery cursors are considered first. Existing
 provider limits and shrinking-catalogue recovery still apply.
 Reaching Manga's provider page cap finishes the accessible pass atomically,
 waits before restarting, and is reported separately as limited coverage.
 
-Schema version 7 adds `jikan_refresh_state`; it does not reset existing cursors or
-rewrite the catalogue. This records successful detail refreshes independently
-of listing timestamps. Listing updates cannot postpone missing detail data.
-On the first optimized run, titles without this new state are eligible and are
-gradually processed within the budget.
+Schema version 7 added `jikan_refresh_state`; version 8 adds only the last
+provider-derived refresh tier and a bounded failure streak. Neither migration
+resets existing cursors, relationships, refresh timestamps, or catalogue rows.
+Detail success remains independent of listing timestamps, so listing updates
+cannot postpone missing detail data. Existing titles without a tier are
+classified conservatively and gradually processed within the budget.
 
-Detail slots rotate between active and archive titles, and between never
-attempted and previously attempted titles within each group. Overdue attempts
-are oldest first. This reserves progress for older titles while new titles
-continue to arrive. Missing seasons are filled by normal detail responses and
-listings; the scheduled worker no longer makes an extra per-title season request.
-The standalone `--backfill-seasons` repair command remains available.
+Detail slots use a deterministic weighted rotation: active/upcoming titles get
+four shares, missing metadata and recently changing titles get two shares each,
+and stable, archived, and retry work get one share each. Active records are
+applied first, while the rotating allocation prevents low-volume runs from
+permanently starving old titles. Repeated failures occupy only the retry share
+and back off exponentially. Missing seasons are filled by normal detail
+responses and listings; the scheduled worker no longer makes an extra per-title
+season request. The standalone `--backfill-seasons` repair command remains
+available.
 
 Refresh intervals are configurable through environment variables:
 
 | Variable | Days | Applies to |
 | --- | --- | --- |
-| `ETL_AIRING_DAYS` | 3 | Airing Anime and publishing Manga/Manhwa; completed seasonal scan restart |
-| `ETL_RECENT_DAYS` | 7 | Upcoming, recently finished, unknown status or unknown finish date |
-| `ETL_STABLE_DAYS` | 60 | Finished titles whose provider end date is at least 90 days ago |
-| `ETL_RETRY_DAYS` | 1 | Temporary failures, malformed results, incomplete detail/streaming responses |
-| `ETL_DISCOVERY_DAYS` | 14 | Restarting a completed bulk catalogue pass |
+| `ETL_AIRING_DAYS` | 3 | Airing, publishing, and upcoming titles; completed seasonal scan restart |
+| `ETL_RECENT_DAYS` | 14 | Non-final statuses and titles completed within the recent window |
+| `ETL_STABLE_DAYS` | 90 | Finished titles between the recent and archive thresholds, or with no trustworthy end date |
+| `ETL_ARCHIVED_DAYS` | 180 | Finished titles whose provider end date is at least five years old |
+| `ETL_RETRY_DAYS` | 1 | Initial temporary, malformed, or incomplete-response retry |
+| `ETL_RETRY_MAX_DAYS` | 14 | Maximum non-404 retry delay after exponential backoff |
+| `ETL_DISCOVERY_DAYS` | 30 | Restarting a completed bulk catalogue pass |
+| `ETL_RECENT_WINDOW_DAYS` | 180 | How long a completed title remains in the recent tier |
+| `ETL_ARCHIVED_AFTER_DAYS` | 1825 | Age at which a completed title enters the archive tier |
 
-All intervals must be positive. They describe eligibility, not a guarantee that
-the next run will reach a title: the 72-hour guard and queue budgets still apply.
-A missing detail endpoint (404) is eligible again after 30 days. A basic-endpoint
-fallback can update available metadata but does not mark full details successful.
+All intervals must be positive; tier intervals must stay ordered from shortest
+to longest, and the recent window must end before the archive threshold. They
+describe eligibility, not a guarantee that the next run will reach a title: the
+72-hour guard and queue budgets still apply.
+Temporary/incomplete failures retry after 1, 2, 4, 8, then at most 14 days. A
+missing detail endpoint (404) backs off through 30, 60, 120, then 180 days. A
+successful complete response resets the failure streak. A basic-endpoint fallback
+can update available metadata but does not mark full details successful.
 
 Valid empty streaming responses back off for 7, 30, then 90 days. Failures retain
 the empty-result streak and retry sooner. Successful detail responses supply
@@ -372,11 +384,13 @@ Run a manual sync from the repository's **Actions** page by selecting
 **Scheduled catalogue metadata sync** and choosing **Run workflow**. All phases
 run inside one Python process, which preserves the shared rate limiter. The
 workflow caches only pip dependencies, keyed by requirements.txt. The step
-summary and `ETL efficiency` JSON log report HTTP attempts, successes, failures,
-requests avoided, selected/changed/unchanged/failed/deferred records, adult-only
-removals, applied/failed pages, cursor positions, fetch/apply seconds, and exhausted
-budget categories. `records_succeeded` counts complete record refreshes, and
-`failure_reasons` separates missing, temporary, invalid and incomplete responses.
+summary and `ETL efficiency` JSON log report HTTP attempts, successes, and
+failures by request lane; requests avoided; candidates, selections, and deferrals
+by refresh tier; selected/inserted/changed/unchanged/failed/deferred records; relationship
+changes; adult-only removals; applied/failed pages; cursor positions; projected
+next eligibility; fetch/apply seconds; and exhausted budget categories.
+`records_succeeded` counts complete record refreshes, and `failure_reasons`
+separates missing, temporary, invalid and incomplete responses.
 Record counters are phase operations, not unique title counts;
 deferred counts cover due detail/streaming queues, while page progress is shown
 by cursor. HTTP success means a parsed response, not necessarily valid title data.
