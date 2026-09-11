@@ -8,7 +8,7 @@ from sqlalchemy import text
 from backend.models import db
 
 
-CATALOGUE_SCHEMA_VERSION = 7
+CATALOGUE_SCHEMA_VERSION = 8
 CATALOGUE_SCHEMA_LOCK_ID = 5_423_769_101
 CATALOGUE_SCHEMA_VERSION_TABLE = "catalogue_schema_version"
 
@@ -160,6 +160,20 @@ def _apply_catalogue_schema_migration(connection) -> None:
     # Use the session's locked transaction rather than opening another engine
     # connection that would sit outside the advisory-lock boundary.
     db.metadata.create_all(bind=connection)
+
+    # Version 8 adds only scheduling metadata. Existing catalogue rows, queue
+    # timestamps, relationships, and discovery cursors remain untouched.
+    if CATALOGUE_SCHEMA_VERSION >= 8:
+        for definition in (
+            "refresh_tier VARCHAR(12)",
+            "failure_streak INTEGER NOT NULL DEFAULT 0",
+        ):
+            db.session.execute(
+                text(
+                    "ALTER TABLE jikan_refresh_state ADD COLUMN IF NOT EXISTS "
+                    f"{definition}"
+                )
+            )
 
     # Daily aggregate rows retain visit totals without persisting the browser
     # cookie, IP address, user agent, query string, or any other identifier.

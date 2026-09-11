@@ -34,6 +34,8 @@ class RequestBudget:
     lane: str = "default"
     lane_limits: dict[str, int] = field(default_factory=dict)
     lane_attempts: dict[str, int] = field(default_factory=dict)
+    lane_successful: dict[str, int] = field(default_factory=dict)
+    lane_failed: dict[str, int] = field(default_factory=dict)
     attempted: int = 0
     successful: int = 0
     failed: int = 0
@@ -51,3 +53,11 @@ class RequestBudget:
         self.check()
         self.attempted += 1
         self.lane_attempts[self.lane] = self.lane_attempts.get(self.lane, 0) + 1
+
+    def record_success(self) -> None:
+        self.successful += 1
+        self.lane_successful[self.lane] = self.lane_successful.get(self.lane, 0) + 1
+
+    def record_failure(self) -> None:
+        self.failed += 1
+        self.lane_failed[self.lane] = self.lane_failed.get(self.lane, 0) + 1

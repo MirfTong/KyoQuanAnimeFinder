@@ -14,7 +14,7 @@ from tempfile import TemporaryFile
 from time import monotonic
 from urllib.error import HTTPError
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, literal, or_, select
 from sqlalchemy.orm import lazyload, load_only, selectinload
 
 from backend.app import app
@@ -30,6 +30,10 @@ from backend.models import (
     db,
 )
 from backend.jobs.refresh_policy import (
+    ACTIVE_STATUSES,
+    DETAIL_TIERS,
+    FINISHED_STATUSES,
+    UPCOMING_STATUSES,
     RefreshPolicy,
     content_snapshot,
     next_streaming_check,
@@ -46,6 +50,7 @@ from backend.services.jikan_client import JikanClient, JikanTemporaryError
 @dataclass
 class SyncMetrics:
     selected: int = 0
+    inserted: int = 0
     changed: int = 0
     unchanged: int = 0
     removed: int = 0
@@ -59,15 +64,65 @@ class SyncMetrics:
     apply_seconds: float = 0
     cursors: dict = field(default_factory=dict)
     provider_caps: list = field(default_factory=list)
+    candidates_by_tier: dict = field(default_factory=dict)
+    selected_by_tier: dict = field(default_factory=dict)
+    deferred_by_tier: dict = field(default_factory=dict)
+    next_eligible_by_tier: dict = field(default_factory=dict)
+    relationships_changed: int = 0
+
+
+DETAIL_TIER_ORDER = ("active", "missing", "recent", "stable", "archived", "retry")
+DETAIL_TIER_WEIGHTS = {
+    "active": 4,
+    "missing": 2,
+    "recent": 2,
+    "stable": 1,
+    "archived": 1,
+    "retry": 1,
+}
+
+
+def _normalized_status(model):
+    return func.replace(
+        func.upper(func.trim(func.coalesce(model.status, ""))), " ", "_"
+    )
+
+
+def _detail_tier(kind, model, state, now):
+    """Return a cheap SQL tier, preferring the last provider-derived tier."""
+    status = _normalized_status(model)
+    dynamic = status.in_(ACTIVE_STATUSES | UPCOMING_STATUSES)
+    finished = status.in_(FINISHED_STATUSES)
+    missing = or_(state.last_success_at.is_(None), status == "")
+    year = Anime.year if kind == "anime" else Manga.publication_year
+    inferred = case(
+        (~finished, "recent"),
+        (year.is_(None), "stable"),
+        (year >= now.year - 1, "recent"),
+        (year >= now.year - 5, "stable"),
+        else_="archived",
+    )
+    return case(
+        (state.last_failure.is_not(None), "retry"),
+        (dynamic, "active"),
+        (missing, "missing"),
+        (state.refresh_tier.in_(DETAIL_TIERS), state.refresh_tier),
+        else_=inferred,
+    )
 
 
 def _due_statement(kind, queue, now, policy):
     model = Anime if kind == "anime" else Manga
     state = JikanRefreshState
-    status = func.upper(func.coalesce(model.status, ""))
-    active = status.in_(("CURRENTLY_AIRING", "CURRENTLY AIRING", "PUBLISHING"))
+    status = _normalized_status(model)
+    active = status.in_(ACTIVE_STATUSES | UPCOMING_STATUSES)
+    tier = (
+        literal("streaming")
+        if queue == "streaming"
+        else _detail_tier(kind, model, state, now)
+    )
     statement = (
-        select(model.mal_id, active.label("active"))
+        select(model.mal_id, tier.label("tier"))
         .outerjoin(
             state,
             and_(
@@ -93,36 +148,85 @@ def _due_statement(kind, queue, now, policy):
             ),
         )
     return statement.where(due).order_by(
-        state.last_attempt_at.asc().nulls_first(), model.mal_id
-    ), active
+        state.last_success_at.asc().nulls_first(),
+        state.last_attempt_at.asc().nulls_first(),
+        model.mal_id,
+    ), tier
 
 
 def plan_details(kind, queue, limit, now, policy):
-    """Reserve half the detail slots for each active/archive queue; fill spare slots."""
-    statement, active = _due_statement(kind, queue, now, policy)
-    total = db.session.scalar(
-        select(func.count()).select_from(statement.order_by(None).subquery())
-    )
-    if queue == "streaming":
-        ids = list(db.session.scalars(statement.limit(limit)))
-    else:
-        # Bounded reads, even on the first run with no refresh-state rows.
-        never = JikanRefreshState.last_attempt_at.is_(None)
-        pools = deque(
-            deque(db.session.scalars(statement.where(group, attempted).limit(limit)))
-            for attempted in (never, ~never)
-            for group in (active, ~active)
+    """Select a bounded, deterministic mix without letting retries starve titles."""
+    statement, tier_expression = _due_statement(kind, queue, now, policy)
+    due = statement.order_by(None).subquery()
+    counts = {
+        tier: count
+        for tier, count in db.session.execute(
+            select(due.c.tier, func.count()).group_by(due.c.tier)
         )
-        ids = []
-        while pools and len(ids) < limit:
-            pool = pools.popleft()
-            if pool:
-                ids.append(pool.popleft())
-                if pool:
-                    pools.append(pool)
-    return [
-        {"kind": kind, "queue": queue, "mal_id": mal_id} for mal_id in ids
-    ], total - len(ids)
+    }
+    if queue == "streaming":
+        rows = list(db.session.execute(statement.limit(limit)))
+    else:
+        state = JikanRefreshState
+        model = Anime if kind == "anime" else Manga
+        candidates = (
+            statement.order_by(None)
+            .add_columns(
+                func.row_number()
+                .over(
+                    partition_by=tier_expression,
+                    order_by=(
+                        state.last_success_at.asc().nulls_first(),
+                        state.last_attempt_at.asc().nulls_first(),
+                        model.mal_id,
+                    ),
+                )
+                .label("tier_rank")
+            )
+            .subquery()
+        )
+        candidate_rows = list(
+            db.session.execute(
+                select(candidates.c.mal_id, candidates.c.tier)
+                .where(candidates.c.tier_rank <= limit)
+                .order_by(candidates.c.tier, candidates.c.tier_rank)
+            )
+        )
+        pools = {
+            tier: deque(
+                (mal_id, candidate_tier)
+                for mal_id, candidate_tier in candidate_rows
+                if candidate_tier == tier
+            )
+            for tier in DETAIL_TIER_ORDER
+            if counts.get(tier)
+        }
+        cycle = [
+            tier for tier in DETAIL_TIER_ORDER for _ in range(DETAIL_TIER_WEIGHTS[tier])
+        ]
+        # Rotate the allocation deterministically between scheduled windows so
+        # even unusually tiny limits cannot permanently exclude a low tier.
+        phase = (now.toordinal() // policy.airing_days) % len(cycle)
+        cycle = cycle[phase:] + cycle[:phase]
+        rows = []
+        while len(rows) < limit and any(pools.values()):
+            selected_this_round = False
+            for tier in cycle:
+                pool = pools.get(tier)
+                if pool and len(rows) < limit:
+                    rows.append(pool.popleft())
+                    selected_this_round = True
+            if not selected_this_round:
+                break
+        rank = {tier: index for index, tier in enumerate(DETAIL_TIER_ORDER)}
+        rows.sort(key=lambda row: (rank[row[1]], row[0]))
+    selected = {tier: 0 for tier in counts}
+    work = []
+    for mal_id, tier in rows:
+        selected[tier] = selected.get(tier, 0) + 1
+        work.append({"kind": kind, "queue": queue, "mal_id": mal_id, "tier": tier})
+    deferred = {tier: count - selected.get(tier, 0) for tier, count in counts.items()}
+    return work, counts, deferred
 
 
 def plan_pages(now, page_limit, policy):
@@ -336,7 +440,13 @@ def fetch_work(client, budget, page_plans, queues, spool, metrics):
             spool.write(json.dumps(record) + "\n")
         except RequestBudgetExhausted:
             if not is_page:
-                metrics.deferred += 1 + len(pending)
+                deferred_items = [item, *pending]
+                metrics.deferred += len(deferred_items)
+                for deferred_item in deferred_items:
+                    tier = deferred_item.get("tier", lane)
+                    metrics.deferred_by_tier[tier] = (
+                        metrics.deferred_by_tier.get(tier, 0) + 1
+                    )
             continue
         except (JikanTemporaryError, HTTPError) as error:
             # A failed page ends only that cursor for this run. Do not advance it.
@@ -378,17 +488,27 @@ def record_attempt(item, data, failure, now, policy):
     state.last_failure = failure
     if failure is None:
         state.last_success_at = now
+        state.failure_streak = 0
+        if item["queue"] == "detail":
+            state.refresh_tier = policy.detail_tier(data, now)
+    else:
+        state.failure_streak = min((state.failure_streak or 0) + 1, 16)
     if item["queue"] == "streaming":
-        state.empty_streak, state.next_attempt_at = next_streaming_check(
-            state.empty_streak,
-            empty=data is not None and data.get("streaming") == [],
-            failed=failure is not None,
-            now=now,
-            policy=policy,
-        )
+        if failure:
+            state.next_attempt_at = now + timedelta(
+                days=policy.retry_delay(failure, state.failure_streak)
+            )
+        else:
+            state.empty_streak, state.next_attempt_at = next_streaming_check(
+                state.empty_streak,
+                empty=data is not None and data.get("streaming") == [],
+                failed=False,
+                now=now,
+                policy=policy,
+            )
     else:
         days = (
-            (30 if failure == "not_found" else policy.retry_days)
+            policy.retry_delay(failure, state.failure_streak)
             if failure
             else policy.detail_days(data, now)
         )
@@ -508,6 +628,7 @@ def apply_details(items, now, policy, metrics):
             authors = manga._author_caches(payloads) if ids["manga"] else None
             associations = anime._association_caches(payloads) if ids["anime"] else None
             stats = anime.AnimeAssociationStats()
+            author_stats = manga.AuthorSyncStats()
             batch = SyncMetrics()
             with db.session.no_autoflush:
                 for item in items:
@@ -547,6 +668,7 @@ def apply_details(items, now, policy, metrics):
                                 genres,
                                 expected_content_type=row.content_type,
                                 authors=authors,
+                                author_stats=author_stats,
                             )
                         if row not in db.session.deleted:
                             changed = before != content_snapshot(row)
@@ -577,12 +699,25 @@ def apply_details(items, now, policy, metrics):
                             {**item, "queue": "streaming"}, data, None, now, policy
                         )
             db.session.commit()
+            batch.relationships_changed = sum(
+                (
+                    stats.studio_links_created,
+                    stats.studio_links_removed,
+                    stats.streaming_links_created,
+                    stats.streaming_links_removed,
+                    stats.streaming_urls_updated,
+                    author_stats.links_created,
+                    author_stats.links_removed,
+                    author_stats.roles_updated,
+                )
+            )
             for key in (
                 "changed",
                 "unchanged",
                 "removed",
                 "failed",
                 "records_succeeded",
+                "relationships_changed",
             ):
                 setattr(metrics, key, getattr(metrics, key) + getattr(batch, key))
             for reason, count in batch.failure_reasons.items():
@@ -645,11 +780,32 @@ def apply_page(item, metrics):
         )
     metrics.pages_applied += 1
     metrics.selected += applied.saved
+    metrics.inserted += applied.inserted
     metrics.changed += applied.changed
     metrics.unchanged += applied.saved - applied.changed
     metrics.removed += getattr(
         applied, "removed_adult", getattr(applied, "removed_hentai", 0)
     )
+    association_stats = getattr(applied, "associations", None)
+    if association_stats is not None:
+        metrics.relationships_changed += sum(
+            (
+                association_stats.studio_links_created,
+                association_stats.studio_links_removed,
+                association_stats.streaming_links_created,
+                association_stats.streaming_links_removed,
+                association_stats.streaming_urls_updated,
+            )
+        )
+    author_stats = getattr(applied, "author_stats", None)
+    if author_stats is not None:
+        metrics.relationships_changed += sum(
+            (
+                author_stats.links_created,
+                author_stats.links_removed,
+                author_stats.roles_updated,
+            )
+        )
     metrics.cursors[item["key"]] = result["page"] + 1 if result["has_next_page"] else 1
 
 
@@ -659,6 +815,9 @@ def report(metrics, budget, outcome):
         "http_attempted": budget.attempted,
         "http_successful": budget.successful,
         "http_failed": budget.failed,
+        "http_attempted_by_lane": dict(sorted(budget.lane_attempts.items())),
+        "http_successful_by_lane": dict(sorted(budget.lane_successful.items())),
+        "http_failed_by_lane": dict(sorted(budget.lane_failed.items())),
         "requests_avoided": budget.avoided,
         "request_limit": budget.limit,
         "exhausted_lanes": sorted(budget.exhausted),
@@ -709,6 +868,7 @@ def run(
     )
     client = JikanClient(budget=budget)
     metrics = SyncMetrics()
+    metrics.next_eligible_by_tier = policy.next_eligible_estimates(now)
     outcome = "failed"
     apply_started = None
     try:
@@ -723,9 +883,24 @@ def run(
                 ("manhwa", "detail", limit // 2, "manhwa"),
                 ("anime", "streaming", streaming_limit, "streaming"),
             ):
-                queues[label], deferred = plan_details(kind, queue, cap, now, policy)
+                queues[label], candidates, deferred = plan_details(
+                    kind, queue, cap, now, policy
+                )
                 metrics.selected += len(queues[label])
-                metrics.deferred += deferred
+                metrics.deferred += sum(deferred.values())
+                for tier, count in candidates.items():
+                    metrics.candidates_by_tier[tier] = (
+                        metrics.candidates_by_tier.get(tier, 0) + count
+                    )
+                for item in queues[label]:
+                    tier = item["tier"]
+                    metrics.selected_by_tier[tier] = (
+                        metrics.selected_by_tier.get(tier, 0) + 1
+                    )
+                for tier, count in deferred.items():
+                    metrics.deferred_by_tier[tier] = (
+                        metrics.deferred_by_tier.get(tier, 0) + count
+                    )
             db.session.remove()
             db.engine.dispose()
         with (

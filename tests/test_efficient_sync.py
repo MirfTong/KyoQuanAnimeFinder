@@ -67,10 +67,16 @@ def full_detail(mal_id=1, **kwargs):
 class PolicyTests(unittest.TestCase):
     def test_status_and_actual_end_date_determine_freshness(self):
         policy = RefreshPolicy()
-        for status in ("Currently Airing", "CURRENTLY_AIRING", "Publishing"):
+        for status in (
+            "Currently Airing",
+            "CURRENTLY_AIRING",
+            "Publishing",
+            "Not yet aired",
+        ):
             self.assertEqual(policy.detail_days({"status": status}, NOW), 3)
-        for status in (None, "Not yet aired", "On Hiatus", "Finished"):
-            self.assertEqual(policy.detail_days({"status": status}, NOW), 7)
+        for status in (None, "On Hiatus"):
+            self.assertEqual(policy.detail_days({"status": status}, NOW), 14)
+        self.assertEqual(policy.detail_days({"status": "Finished"}, NOW), 90)
         self.assertEqual(
             policy.detail_days(
                 {
@@ -79,20 +85,55 @@ class PolicyTests(unittest.TestCase):
                 },
                 NOW,
             ),
-            7,
+            14,
         )
         self.assertEqual(
             policy.detail_days(
                 {"status": "Finished", "published": {"to": "2010-01-01T00:00:00Z"}}, NOW
             ),
-            60,
+            180,
         )
         self.assertEqual(
             policy.detail_days(
                 {"status": "Finished", "published": {"from": "1990-01-01"}}, NOW
             ),
-            7,
+            90,
         )
+
+    def test_old_completed_titles_refresh_less_often_than_stable_titles(self):
+        policy = RefreshPolicy()
+        stable = {
+            "status": "Finished Airing",
+            "aired": {"to": (NOW - timedelta(days=700)).isoformat()},
+        }
+        archived = {
+            "status": "Finished Airing",
+            "aired": {"to": (NOW - timedelta(days=3000)).isoformat()},
+        }
+        self.assertEqual(policy.detail_tier(stable, NOW), "stable")
+        self.assertEqual(policy.detail_days(stable, NOW), 90)
+        self.assertEqual(policy.detail_tier(archived, NOW), "archived")
+        self.assertEqual(policy.detail_days(archived, NOW), 180)
+
+    def test_repeated_failures_use_bounded_exponential_backoff(self):
+        policy = RefreshPolicy()
+        self.assertEqual(
+            [policy.retry_delay("temporary", streak) for streak in range(1, 7)],
+            [1, 2, 4, 8, 14, 14],
+        )
+        self.assertEqual(
+            [policy.retry_delay("not_found", streak) for streak in range(1, 5)],
+            [30, 60, 120, 180],
+        )
+
+    def test_policy_rejects_misordered_intervals(self):
+        for values in (
+            {"stable_days": 10, "recent_days": 20},
+            {"retry_days": 5, "retry_max_days": 4},
+            {"recent_window_days": 2000, "archived_after_days": 1000},
+        ):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                RefreshPolicy(**values)
 
     def test_empty_backoff_and_transient_failures_are_distinct(self):
         streak = 0
@@ -140,6 +181,7 @@ class FetchTests(unittest.TestCase):
         client._streaming_base_url = "https://second.test/v4"
         client.get_anime_streaming(1)
         self.assertEqual(opener.call_count, 2)
+        self.assertEqual(budget.lane_successful, {"default": 2})
 
     def test_partial_streaming_from_detail_does_not_suppress_valid_request(self):
         client = Mock()
@@ -178,6 +220,7 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(
             (budget.attempted, budget.failed, budget.successful), (2, 2, 0)
         )
+        self.assertEqual(budget.lane_failed, {"default": 2})
 
     def test_malformed_json_counts_as_http_failure(self):
         budget = RequestBudget(4)
@@ -389,9 +432,19 @@ class PersistenceTests(unittest.TestCase):
                 last_attempt_at=NOW - timedelta(days=100),
                 next_attempt_at=NOW - timedelta(days=1),
             )
-        work, deferred = worker.plan_details("anime", "detail", 4, NOW, RefreshPolicy())
-        self.assertEqual([record["mal_id"] for record in work], [1, 5, 3, 7])
-        self.assertEqual(deferred, 4)
+        work, candidates, deferred = worker.plan_details(
+            "anime", "detail", 4, NOW, RefreshPolicy()
+        )
+        self.assertEqual(sum(candidates.values()), 8)
+        self.assertEqual(sum(deferred.values()), 4)
+        self.assertEqual(len(work), 4)
+        self.assertEqual(
+            [record["tier"] for record in work],
+            sorted(
+                [record["tier"] for record in work],
+                key=worker.DETAIL_TIER_ORDER.index,
+            ),
+        )
 
     def test_listing_does_not_postpone_detail_and_newly_active_title_is_accelerated(
         self,
@@ -405,14 +458,74 @@ class PersistenceTests(unittest.TestCase):
         )
         self.anime(3)
         self.state(3, next_attempt_at=NOW + timedelta(days=10))
-        work, _ = worker.plan_details("anime", "detail", 10, NOW, RefreshPolicy())
+        work, _, _ = worker.plan_details("anime", "detail", 10, NOW, RefreshPolicy())
         self.assertEqual({record["mal_id"] for record in work}, {1, 2})
+
+    def test_missing_metadata_promotes_an_archived_title(self):
+        self.anime(1, status=None)
+        self.state(
+            1,
+            last_attempt_at=NOW - timedelta(days=200),
+            last_success_at=NOW - timedelta(days=200),
+            next_attempt_at=NOW - timedelta(days=1),
+            refresh_tier="archived",
+        )
+        work, candidates, _ = worker.plan_details(
+            "anime", "detail", 10, NOW, RefreshPolicy()
+        )
+        self.assertEqual(candidates, {"missing": 1})
+        self.assertEqual(work[0]["tier"], "missing")
+
+    def test_tiny_limits_rotate_without_starving_archived_titles(self):
+        for mal_id in range(1, 9):
+            self.anime(mal_id, "CURRENTLY_AIRING")
+            self.state(
+                mal_id,
+                last_attempt_at=NOW - timedelta(days=4),
+                last_success_at=NOW - timedelta(days=4),
+                next_attempt_at=NOW - timedelta(days=1),
+                refresh_tier="active",
+            )
+        self.anime(99)
+        self.state(
+            99,
+            last_attempt_at=NOW - timedelta(days=200),
+            last_success_at=NOW - timedelta(days=200),
+            next_attempt_at=NOW - timedelta(days=1),
+            refresh_tier="archived",
+        )
+        selected = set()
+        for offset in range(len(worker.DETAIL_TIER_WEIGHTS)):
+            work, _, _ = worker.plan_details(
+                "anime",
+                "detail",
+                2,
+                NOW + timedelta(days=offset * 3),
+                RefreshPolicy(),
+            )
+            selected.update(item["mal_id"] for item in work)
+        self.assertIn(99, selected)
 
     def test_planner_selects_ids_without_synopsis_or_relationship_objects(self):
         statement, _ = worker._due_statement("anime", "detail", NOW, RefreshPolicy())
         projection = str(statement).split("FROM")[0]
         self.assertNotIn("synopsis", projection)
         self.assertNotIn("genres", projection)
+
+    def test_tier_planning_uses_two_bounded_database_round_trips(self):
+        for mal_id, status in ((1, "CURRENTLY_AIRING"), (2, "FINISHED_AIRING")):
+            self.anime(mal_id, status)
+        statements = []
+        event.listen(
+            self.engine,
+            "before_cursor_execute",
+            lambda connection, cursor, sql, *args: statements.append(sql),
+        )
+        work, _, _ = worker.plan_details("anime", "detail", 10, NOW, RefreshPolicy())
+        self.assertEqual(len(work), 2)
+        self.assertEqual(
+            len([sql for sql in statements if sql.startswith("SELECT")]), 2
+        )
 
     def test_manga_sparse_genres_preserved_and_detail_freshness_is_separate(self):
         row = Manga(
@@ -629,7 +742,9 @@ class PersistenceTests(unittest.TestCase):
                 utc(state.next_attempt_at), checked_at + timedelta(days=days)
             )
             checked_at += timedelta(days=days)
-        work, _ = worker.plan_details("anime", "streaming", 100, NOW, RefreshPolicy())
+        work, _, _ = worker.plan_details(
+            "anime", "streaming", 100, NOW, RefreshPolicy()
+        )
         self.assertEqual(work, [])
 
     def test_malformed_streaming_preserves_links_and_retries_soon(self):
@@ -723,6 +838,34 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(utc(state.next_attempt_at), NOW + timedelta(days=1))
         self.assertIsNone(state.last_success_at)
 
+    def test_retry_backoff_grows_and_success_resets_the_failure_streak(self):
+        row = self.anime()
+        first = item(failure="temporary")
+        worker.apply_details([first], NOW, RefreshPolicy(), self.metrics)
+        worker.apply_details(
+            [first], NOW + timedelta(days=1), RefreshPolicy(), self.metrics
+        )
+        state = self.session.get(JikanRefreshState, ("anime", 1, "detail"))
+        self.assertEqual(state.failure_streak, 2)
+        self.assertEqual(utc(state.next_attempt_at), NOW + timedelta(days=3))
+
+        worker.apply_details(
+            [
+                item(
+                    data=full_detail(
+                        aired={"to": (NOW - timedelta(days=3000)).isoformat()}
+                    )
+                )
+            ],
+            NOW + timedelta(days=3),
+            RefreshPolicy(),
+            self.metrics,
+        )
+        self.assertEqual(row.title, "Example")
+        self.assertEqual(state.failure_streak, 0)
+        self.assertEqual(state.refresh_tier, "archived")
+        self.assertEqual(utc(state.next_attempt_at), NOW + timedelta(days=183))
+
     def test_page_commit_and_cursor_are_atomic_and_replay_is_idempotent(self):
         page = {
             "kind": "anime_page",
@@ -747,6 +890,7 @@ class PersistenceTests(unittest.TestCase):
         worker.apply_page(page, self.metrics)
         self.assertEqual(len(list(self.session.scalars(select(Anime)))), 1)
         self.assertEqual(self.session.get(JikanSyncState, page["key"]).next_page, 5)
+        self.assertEqual(self.metrics.inserted, 1)
         self.assertEqual((self.metrics.changed, self.metrics.unchanged), (1, 1))
 
     def test_completed_catalogue_waits_but_partial_cursor_resumes(self):
