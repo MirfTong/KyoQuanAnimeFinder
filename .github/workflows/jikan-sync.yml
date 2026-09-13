@@ -2,7 +2,7 @@ name: Scheduled catalogue metadata sync
 
 on:
   schedule:
-    # Check daily; the cadence guard runs the ETL only after 72 hours.
+    # Check daily; the cadence guard runs the ETL only after 48 hours.
     - cron: "17 5 * * *"
   workflow_dispatch:
 
@@ -24,11 +24,11 @@ jobs:
       PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v7
-      - name: Enforce the 72-hour scheduled cadence
+      - name: Enforce the 48-hour scheduled cadence
         id: cadence
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python -m backend.jobs.sync_guard --workflow jikan-sync.yml --minimum-hours 72
+        run: python -m backend.jobs.sync_guard --workflow jikan-sync.yml --minimum-hours 48
       - uses: actions/setup-python@v7
         if: steps.cadence.outputs.should_run == 'true'
         with:

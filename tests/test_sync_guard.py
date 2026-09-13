@@ -18,7 +18,7 @@ class SyncGuardTests(unittest.TestCase):
 
     def test_first_scheduled_run_is_allowed(self):
         should_run, _reason = should_run_scheduled_sync(
-            [], now=self.now, minimum_hours=72
+            [], now=self.now, minimum_hours=48
         )
 
         self.assertTrue(should_run)
@@ -50,15 +50,15 @@ class SyncGuardTests(unittest.TestCase):
             )
 
         should_run, _reason = should_run_scheduled_sync(
-            verified_runs, now=self.now, minimum_hours=72
+            verified_runs, now=self.now, minimum_hours=48
         )
         self.assertTrue(should_run)
 
     def test_recent_success_is_skipped(self):
         should_run, reason = should_run_scheduled_sync(
-            [{"run_started_at": (self.now - timedelta(hours=71)).isoformat()}],
+            [{"run_started_at": (self.now - timedelta(hours=47)).isoformat()}],
             now=self.now,
-            minimum_hours=72,
+            minimum_hours=48,
         )
 
         self.assertFalse(should_run)
@@ -66,12 +66,29 @@ class SyncGuardTests(unittest.TestCase):
 
     def test_success_at_exact_interval_is_allowed(self):
         should_run, _reason = should_run_scheduled_sync(
-            [{"run_started_at": (self.now - timedelta(hours=72)).isoformat()}],
+            [{"run_started_at": (self.now - timedelta(hours=48)).isoformat()}],
             now=self.now,
-            minimum_hours=72,
+            minimum_hours=48,
         )
 
         self.assertTrue(should_run)
+
+    def test_success_after_interval_is_allowed(self):
+        should_run, _reason = should_run_scheduled_sync(
+            [{"run_started_at": (self.now - timedelta(hours=49)).isoformat()}],
+            now=self.now,
+            minimum_hours=48,
+        )
+
+        self.assertTrue(should_run)
+
+    def test_default_minimum_interval_is_48_hours(self):
+        with patch("sys.argv", ["sync_guard", "--workflow", "jikan-sync.yml"]):
+            from backend.jobs.sync_guard import build_parser
+
+            args = build_parser().parse_args()
+
+        self.assertEqual(args.minimum_hours, 48)
 
     def test_manual_dispatch_bypasses_github_api_lookup(self):
         with (
@@ -112,7 +129,7 @@ class SyncGuardTests(unittest.TestCase):
                 {
                     "name": "Sync Anime, Manga, and Manhwa",
                     "conclusion": "success",
-                    "completed_at": (self.now - timedelta(hours=73)).isoformat(),
+                    "completed_at": (self.now - timedelta(hours=49)).isoformat(),
                 }
             ]
         }
@@ -132,7 +149,7 @@ class SyncGuardTests(unittest.TestCase):
             )
 
         should_run, _reason = should_run_scheduled_sync(
-            verified_runs, now=self.now, minimum_hours=72
+            verified_runs, now=self.now, minimum_hours=48
         )
         self.assertTrue(should_run)
         self.assertEqual([run["id"] for run in verified_runs], [100])
@@ -339,7 +356,7 @@ class SyncGuardTests(unittest.TestCase):
     def test_prior_etl_without_aware_timestamp_fails_closed(self):
         for run in ({}, {"run_started_at": "2026-08-10T12:00:00"}):
             with self.subTest(run=run), self.assertRaises(ValueError):
-                should_run_scheduled_sync([run], now=self.now, minimum_hours=72)
+                should_run_scheduled_sync([run], now=self.now, minimum_hours=48)
 
     def test_invalid_verified_timestamp_produces_explicit_safe_failure(self):
         with (

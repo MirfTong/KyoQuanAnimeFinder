@@ -264,7 +264,7 @@ def _write_summary(should_run: bool, reason: str) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workflow", required=True)
-    parser.add_argument("--minimum-hours", type=int, default=72)
+    parser.add_argument("--minimum-hours", type=int, default=48)
     return parser
 
 

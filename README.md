@@ -312,7 +312,7 @@ Refresh intervals are configurable through environment variables:
 All intervals must be positive; tier intervals must stay ordered from shortest
 to longest, and the recent window must end before the archive threshold. They
 describe eligibility, not a guarantee that the next run will reach a title: the
-72-hour guard and queue budgets still apply.
+48-hour guard and queue budgets still apply.
 Temporary/incomplete failures retry after 1, 2, 4, 8, then at most 14 days. A
 missing detail endpoint (404) backs off through 30, 60, 120, then 180 days. A
 successful complete response resets the failure streak. A basic-endpoint fallback
@@ -336,11 +336,11 @@ incoming batch. Existing adult-only cleanup remains; no catalogue pruning is
 performed to meet a storage quota. Facets are published only after changes.
 
 A fully applied budget-limited run is successful even when work remains, and
-counts toward the 72-hour cadence. Deferred/unfetched titles are not marked
+counts toward the 48-hour cadence. Deferred/unfetched titles are not marked
 attempted. When at least one verified page or complete record is committed,
 routine item failures (404s, exhausted temporary retries, sparse responses) and
 failed pages produce `success_with_warnings`, not a failed workflow. This counts
-toward the same 72-hour interval, preventing one unavailable title from causing
+toward the same 48-hour interval, preventing one unavailable title from causing
 another full ETL every day. Failed items retain retry state; failed pages do not
 advance. Partial detail payloads may safely improve metadata, but do not mark
 detail freshness successful: title/status, genres and studios (Anime) or authors
@@ -372,7 +372,7 @@ Useful focused commands are:
 ## Scheduled GitHub Actions sync
 
 `.github/workflows/jikan-sync.yml` wakes once per day. A read-only GitHub Actions
-API guard starts the ETL only when at least 72 hours have passed since the last
+API guard starts the ETL only when at least 48 hours have passed since the last
 scheduled run whose **Sync Anime, Manga, and Manhwa** step completed successfully.
 Successful daily runs where that step was skipped do not reset the interval. The
 guard inspects workflow jobs and steps, and fails closed without starting a

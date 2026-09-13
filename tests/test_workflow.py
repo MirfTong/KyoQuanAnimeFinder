@@ -8,12 +8,12 @@ WORKFLOW = (
 
 
 class JikanWorkflowTests(unittest.TestCase):
-    def test_sync_checks_daily_and_enforces_a_72_hour_cadence(self):
+    def test_sync_checks_daily_and_enforces_a_48_hour_cadence(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
 
         self.assertIn('cron: "17 5 * * *"', workflow)
         self.assertIn(
-            "sync_guard --workflow jikan-sync.yml --minimum-hours 72",
+            "sync_guard --workflow jikan-sync.yml --minimum-hours 48",
             workflow,
         )
         self.assertIn("actions: read", workflow)
