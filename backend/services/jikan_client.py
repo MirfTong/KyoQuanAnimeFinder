@@ -28,6 +28,7 @@ MAX_TRANSIENT_RETRY_BUDGET = 100
 # Match the providers' rolling per-minute window before probing the primary
 # again; a longer Retry-After header still takes precedence.
 PRIMARY_429_COOLDOWN_SECONDS = 60
+STREAMING_PROVIDER_COOLDOWN_SECONDS = 60
 REQUEST_TIMEOUT_SECONDS = 20
 SERVER_ERROR_STATUS_CODES = frozenset({500, 502, 503, 504})
 CATALOGUE_ANIME_TYPES = frozenset(
@@ -101,6 +102,7 @@ class JikanClient:
         self._request_times: deque[float] = deque()
         self._last_request_time: float | None = None
         self._primary_cooldown_until = 0.0
+        self._streaming_cooldown_until = 0.0
         self._transient_retries_remaining = transient_retry_budget
         configured_base_url = (
             base_url
@@ -162,9 +164,39 @@ class JikanClient:
         avoiding a guaranteed no-op request before every useful request.
         """
         self._validate_mal_id(mal_id)
+        path = f"/anime/{mal_id}/full"
+        if (
+            self._streaming_base_url == self._base_url
+            or self._streaming_cooldown_is_active()
+        ):
+            return self._get_from_base(
+                self._base_url,
+                path,
+                max_transient_retries=MAX_ANIME_TRANSIENT_RETRIES,
+                retry_network_errors=True,
+            )
+
+        try:
+            return self._get_from_base(
+                self._streaming_base_url,
+                path,
+                max_transient_retries=MAX_ANIME_TRANSIENT_RETRIES,
+                retry_network_errors=True,
+            )
+        except HTTPError as error:
+            if error.code not in {429, *SERVER_ERROR_STATUS_CODES}:
+                raise
+            self._start_streaming_cooldown(error)
+        except JikanTemporaryError:
+            self._start_streaming_cooldown()
+
+        # Streaming enrichment is optional, but repeated provider outages were
+        # consuming the entire reserved lane. The primary provider's full
+        # response is a safe fallback; payload completeness is still validated
+        # by the ETL before refresh state can be marked successful.
         return self._get_from_base(
-            self._streaming_base_url,
-            f"/anime/{mal_id}/full",
+            self._base_url,
+            path,
             max_transient_retries=MAX_ANIME_TRANSIENT_RETRIES,
             retry_network_errors=True,
         )
@@ -515,6 +547,23 @@ class JikanClient:
         with self._lock:
             self._primary_cooldown_until = max(
                 self._primary_cooldown_until,
+                self._clock() + cooldown_seconds,
+            )
+
+    def _streaming_cooldown_is_active(self) -> bool:
+        with self._lock:
+            return self._clock() < self._streaming_cooldown_until
+
+    def _start_streaming_cooldown(self, error: HTTPError | None = None) -> None:
+        cooldown_seconds = STREAMING_PROVIDER_COOLDOWN_SECONDS
+        if error is not None:
+            cooldown_seconds = max(
+                cooldown_seconds,
+                self._retry_delay(error, MAX_429_RETRIES),
+            )
+        with self._lock:
+            self._streaming_cooldown_until = max(
+                self._streaming_cooldown_until,
                 self._clock() + cooldown_seconds,
             )
 

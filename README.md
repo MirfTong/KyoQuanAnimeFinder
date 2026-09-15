@@ -230,7 +230,11 @@ primary provider and public Jikan v4 as a fallback. Override the endpoints with
 `ANIME_API_BASE_URL` and `ANIME_API_FALLBACK_BASE_URL`. Streaming enrichment
 uses Jikan directly by default because Tenrai's otherwise valid full responses
 rarely include service links; override that endpoint separately with
-`ANIME_STREAMING_API_BASE_URL`.
+`ANIME_STREAMING_API_BASE_URL`. If that streaming provider has a temporary
+network, rate-limit, or server failure, the client falls back to the primary
+provider and briefly cools the failing endpoint so one outage cannot consume
+the entire reserved streaming budget. The ETL still validates that streaming
+data is complete before marking the enrichment successful.
 
 Anime and manga calls share one process-wide limiter capped at three requests
 per second and 55 requests per minute. Temporary network failures and 5xx

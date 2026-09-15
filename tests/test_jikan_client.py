@@ -11,6 +11,7 @@ from backend.services.jikan_client import (
     JikanSeasonPage,
     JikanTemporaryError,
     PRIMARY_429_COOLDOWN_SECONDS,
+    STREAMING_PROVIDER_COOLDOWN_SECONDS,
 )
 
 
@@ -199,6 +200,76 @@ class JikanClientTests(unittest.TestCase):
         self.assertEqual(
             seen_urls,
             ["https://primary.example/v1/anime/1/full"],
+        )
+
+    def test_streaming_provider_outage_falls_back_and_cools_down(self):
+        seen_urls = []
+        clock = FakeClock()
+
+        def opener(request, *, timeout):
+            seen_urls.append(request.full_url)
+            if request.full_url.startswith("https://streaming.example"):
+                raise http_error(request.full_url, 504)
+            return Response(
+                b'{"data": {"mal_id": 1, "streaming": '
+                b'[{"name": "Primary", "url": "https://example.test/1"}]}}'
+            )
+
+        client = JikanClient(
+            opener=opener,
+            clock=clock,
+            sleeper=clock.sleep,
+            transient_retry_budget=0,
+            base_url="https://primary.example/v1",
+            fallback_base_url="https://fallback.example/v4",
+            streaming_base_url="https://streaming.example/v4",
+        )
+
+        first = client.get_anime_streaming(1)
+        second = client.get_anime_streaming(1)
+
+        self.assertEqual(first["data"]["streaming"][0]["name"], "Primary")
+        self.assertEqual(second["data"]["streaming"][0]["name"], "Primary")
+        self.assertEqual(
+            seen_urls,
+            [
+                "https://streaming.example/v4/anime/1/full",
+                "https://primary.example/v1/anime/1/full",
+                "https://primary.example/v1/anime/1/full",
+            ],
+        )
+
+        clock.now += STREAMING_PROVIDER_COOLDOWN_SECONDS
+        client.get_anime_streaming(1)
+        self.assertEqual(
+            seen_urls[-2:],
+            [
+                "https://streaming.example/v4/anime/1/full",
+                "https://primary.example/v1/anime/1/full",
+            ],
+        )
+
+    def test_streaming_provider_404_does_not_fall_back(self):
+        seen_urls = []
+
+        def opener(request, *, timeout):
+            seen_urls.append(request.full_url)
+            raise http_error(request.full_url, 404)
+
+        client = JikanClient(
+            opener=opener,
+            base_url="https://primary.example/v1",
+            fallback_base_url="https://fallback.example/v4",
+            streaming_base_url="https://streaming.example/v4",
+        )
+
+        with self.assertRaises(HTTPError) as raised:
+            client.get_anime_streaming(1)
+
+        self.assertEqual(raised.exception.code, 404)
+        self.assertEqual(
+            seen_urls,
+            ["https://streaming.example/v4/anime/1/full"],
         )
 
     def test_fetches_basic_and_full_manga_payloads(self):
