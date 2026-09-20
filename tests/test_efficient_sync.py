@@ -70,6 +70,7 @@ class PolicyTests(unittest.TestCase):
         for status in (
             "Currently Airing",
             "CURRENTLY_AIRING",
+            "Currently-Airing",
             "Publishing",
             "Not yet aired",
         ):
@@ -98,6 +99,9 @@ class PolicyTests(unittest.TestCase):
                 {"status": "Finished", "published": {"from": "1990-01-01"}}, NOW
             ),
             90,
+        )
+        self.assertEqual(
+            policy.detail_tier({"status": "Not yet aired"}, NOW), "upcoming"
         )
 
     def test_old_completed_titles_refresh_less_often_than_stable_titles(self):
@@ -415,6 +419,24 @@ class PersistenceTests(unittest.TestCase):
         self.session.commit()
         return row
 
+    def print_title(self, mal_id, content_type, status="Finished"):
+        row = Manga(
+            mal_id=mal_id,
+            content_type=content_type,
+            title=f"Example {mal_id}",
+            manga_type="Manga" if content_type == "MANGA" else "Manhwa",
+            publication_year=2020,
+            status=status,
+            is_adult=False,
+            mal_url="https://example.test",
+            image_url="",
+            legacy_genres=[],
+            genres_detailed=[],
+        )
+        self.session.add(row)
+        self.session.commit()
+        return row
+
     def state(self, mal_id=1, queue="detail", **kwargs):
         row = JikanRefreshState(
             kind="anime", mal_id=mal_id, queue=queue, empty_streak=0, **kwargs
@@ -445,6 +467,89 @@ class PersistenceTests(unittest.TestCase):
                 key=worker.DETAIL_TIER_ORDER.index,
             ),
         )
+
+    def test_active_titles_receive_eighty_percent_of_a_busy_lane(self):
+        for mal_id in range(1, 21):
+            self.anime(mal_id, "CURRENTLY_AIRING")
+        for mal_id in range(21, 61):
+            self.anime(mal_id, "FINISHED_AIRING")
+            self.state(
+                mal_id,
+                last_success_at=NOW - timedelta(days=200),
+                next_attempt_at=NOW - timedelta(days=1),
+                refresh_tier="archived",
+            )
+
+        work, candidates, deferred = worker.plan_details(
+            "anime", "detail", 10, NOW, RefreshPolicy()
+        )
+
+        self.assertEqual(candidates["active"], 20)
+        self.assertEqual(sum(item["tier"] == "active" for item in work), 8)
+        self.assertEqual(deferred["active"], 12)
+
+    def test_each_media_lane_reserves_slots_for_current_titles(self):
+        for mal_id in range(1, 7):
+            self.print_title(mal_id, "MANGA", "Publishing")
+            self.print_title(100 + mal_id, "MANHWA", "Publishing")
+        for mal_id in range(20, 30):
+            self.print_title(mal_id, "MANGA")
+            self.print_title(100 + mal_id, "MANHWA")
+
+        for kind in ("manga", "manhwa"):
+            with self.subTest(kind=kind):
+                work, _, _ = worker.plan_details(
+                    kind, "detail", 5, NOW, RefreshPolicy()
+                )
+                self.assertEqual(
+                    sum(item["tier"] == "active" for item in work), 4
+                )
+
+    def test_active_retry_stays_in_the_priority_lane(self):
+        self.anime(1, "Currently-Airing")
+        self.state(
+            1,
+            last_attempt_at=NOW - timedelta(days=2),
+            next_attempt_at=NOW - timedelta(hours=1),
+            last_failure="temporary",
+        )
+
+        work, candidates, _ = worker.plan_details(
+            "anime", "detail", 2, NOW, RefreshPolicy()
+        )
+
+        self.assertEqual(candidates, {"active": 1})
+        self.assertEqual(work[0]["tier"], "active")
+
+    def test_upcoming_title_moves_into_active_reserve_when_status_changes(self):
+        row = self.anime(1, "NOT_YET_AIRED")
+        self.state(
+            1,
+            last_success_at=NOW - timedelta(days=4),
+            next_attempt_at=NOW - timedelta(hours=1),
+            refresh_tier="upcoming",
+        )
+
+        work, _, _ = worker.plan_details(
+            "anime", "detail", 2, NOW, RefreshPolicy()
+        )
+        self.assertEqual(work[0]["tier"], "upcoming")
+
+        row.status = "CURRENTLY_AIRING"
+        self.session.commit()
+        work, _, _ = worker.plan_details(
+            "anime", "detail", 2, NOW, RefreshPolicy()
+        )
+        self.assertEqual(work[0]["tier"], "active")
+
+    def test_active_health_reports_never_verified_and_oldest_age(self):
+        self.anime(1, "CURRENTLY_AIRING")
+        self.anime(2, "AIRING")
+        self.state(2, last_success_at=NOW - timedelta(days=9))
+
+        total, never, oldest_age = worker.active_refresh_health("anime", NOW)
+
+        self.assertEqual((total, never, oldest_age), (2, 1, 9.0))
 
     def test_listing_does_not_postpone_detail_and_newly_active_title_is_accelerated(
         self,
@@ -810,6 +915,27 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual((self.metrics.changed, self.metrics.unchanged), (0, 1))
         self.assertEqual(row.last_jikan_sync, original)
         self.assertFalse(any(sql.startswith("UPDATE anime ") for sql in statements))
+
+    def test_summary_classifies_fetch_validation_and_change_by_media_tier(self):
+        self.anime()
+        worker.apply_details(
+            [
+                item(
+                    data={**full_detail(), "title": "Changed"},
+                )
+                | {"tier": "active"}
+            ],
+            NOW,
+            RefreshPolicy(),
+            self.metrics,
+        )
+
+        self.assertEqual(self.metrics.fetched_by_media_and_tier, {"anime:active": 1})
+        self.assertEqual(
+            self.metrics.validated_by_media_and_tier, {"anime:active": 1}
+        )
+        self.assertEqual(self.metrics.changed_by_media_and_tier, {"anime:active": 1})
+        self.assertEqual(self.metrics.failed_by_media_and_tier, {})
 
     def test_apply_failure_rolls_back_metadata_and_due_state(self):
         row = self.anime()

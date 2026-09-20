@@ -12,7 +12,7 @@ UPCOMING_STATUSES = frozenset(
     {"NOT_YET_AIRED", "NOT_YET_AIRING", "NOT_YET_PUBLISHED", "UPCOMING"}
 )
 FINISHED_STATUSES = frozenset({"FINISHED", "FINISHED_AIRING"})
-DETAIL_TIERS = ("active", "recent", "stable", "archived")
+DETAIL_TIERS = ("active", "upcoming", "recent", "stable", "archived")
 
 
 def utc(value: datetime) -> datetime:
@@ -63,13 +63,21 @@ class RefreshPolicy:
 
     @staticmethod
     def normalized_status(value) -> str:
-        return str(value or "").strip().upper().replace(" ", "_")
+        return (
+            str(value or "")
+            .strip()
+            .upper()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
 
     def detail_tier(self, data: dict, now: datetime) -> str:
         """Classify complete detail data by its likelihood of changing."""
         status = self.normalized_status(data.get("status"))
-        if status in ACTIVE_STATUSES | UPCOMING_STATUSES:
+        if status in ACTIVE_STATUSES:
             return "active"
+        if status in UPCOMING_STATUSES:
+            return "upcoming"
         if status not in FINISHED_STATUSES:
             return "recent"
         dates = data.get("aired") or data.get("published")
@@ -92,6 +100,7 @@ class RefreshPolicy:
             raise ValueError(f"Unknown refresh tier: {tier}")
         return {
             "active": self.airing_days,
+            "upcoming": self.airing_days,
             "recent": self.recent_days,
             "stable": self.stable_days,
             "archived": self.archived_days,

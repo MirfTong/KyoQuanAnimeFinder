@@ -513,7 +513,13 @@ function DetailModal({ item, loading, onClose }) {
 
   const contentType = itemContentType(item);
   const tags = item.genres_detailed ?? item.tags ?? [];
-  const freshness = formatFreshness(item.last_jikan_sync);
+  const verifiedRefresh = item.last_verified_refresh;
+  const freshnessTimestamp = verifiedRefresh ?? item.last_jikan_sync;
+  const freshness = formatFreshness(
+    freshnessTimestamp,
+    new Date(),
+    verifiedRefresh ? "Details checked with Jikan" : "Last catalogue change",
+  );
   const studios = contentType === "ANIME" ? namedValues(item.studios) : [];
   const authors = contentType === "ANIME"
     ? []
@@ -693,7 +699,7 @@ function DetailModal({ item, loading, onClose }) {
             {freshness && (
               <p
                 className="text-xs text-slate-500"
-                title={new Date(item.last_jikan_sync).toLocaleString()}
+                title={new Date(freshnessTimestamp).toLocaleString()}
               >
                 {freshness}
               </p>

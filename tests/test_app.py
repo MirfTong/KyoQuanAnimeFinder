@@ -12,6 +12,7 @@ from backend.app import (
     CacheGenerationMonitor,
     FRONTEND_BUILD_DIR,
     TtlCache,
+    _attach_verified_refresh,
     _analytics_report,
     _record_site_visit,
     _anime_statement,
@@ -147,6 +148,15 @@ class AppTests(unittest.TestCase):
         self.assertIn("season", body["item"])
         self.assertIn("synopsis", body["item"])
         self.assertIn("genres_detailed", body["item"])
+
+    def test_detail_freshness_uses_verified_refresh_state(self):
+        verified = datetime(2026, 9, 19, 9, 30, tzinfo=timezone.utc)
+        payload = {"last_jikan_sync": "2026-09-01T00:00:00+00:00"}
+
+        with patch("backend.app.db.session.scalar", return_value=verified):
+            _attach_verified_refresh(payload, "anime", 52991)
+
+        self.assertEqual(payload["last_verified_refresh"], verified.isoformat())
 
     def test_anime_list_accepts_a_season_filter(self):
         response = self.client.get("/api/v1/anime?season=winter&per_page=2")
