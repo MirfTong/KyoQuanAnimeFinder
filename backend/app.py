@@ -28,6 +28,7 @@ from backend.models import (
     Author,
     CatalogueFacet,
     Genre,
+    JikanRefreshState,
     JikanSyncState,
     Manga,
     MangaAuthor,
@@ -865,6 +866,18 @@ def _serialize_manga(
     return payload
 
 
+def _attach_verified_refresh(payload: dict[str, Any], kind: str, mal_id: int) -> None:
+    """Expose the last complete detail response separately from content changes."""
+    timestamp = db.session.scalar(
+        select(JikanRefreshState.last_success_at).where(
+            JikanRefreshState.kind == kind,
+            JikanRefreshState.queue == "detail",
+            JikanRefreshState.mal_id == mal_id,
+        )
+    )
+    payload["last_verified_refresh"] = timestamp.isoformat() if timestamp else None
+
+
 def _public_statement(model, *, preview: bool = False, detailed: bool = False):
     """Return the indexed, ETL-maintained public catalogue query."""
     statement = (
@@ -1627,7 +1640,9 @@ def _catalogue_detail_response(content_type: str, mal_id: int):
         )
         if entry is None:
             raise ApiError("Anime not found", 404)
-        return jsonify({"item": _serialize_anime(entry, detailed=True)})
+        payload = _serialize_anime(entry, detailed=True)
+        _attach_verified_refresh(payload, "anime", mal_id)
+        return jsonify({"item": payload})
 
     entry = db.session.scalar(
         _manga_statement({normalized_type}, detailed=True).where(
@@ -1637,7 +1652,9 @@ def _catalogue_detail_response(content_type: str, mal_id: int):
     if entry is None:
         label = "Manga" if normalized_type == "MANGA" else "Manhwa"
         raise ApiError(f"{label} not found", 404)
-    return jsonify({"item": _serialize_manga(entry, detailed=True)})
+    payload = _serialize_manga(entry, detailed=True)
+    _attach_verified_refresh(payload, normalized_type.casefold(), mal_id)
+    return jsonify({"item": payload})
 
 
 @app.get(f"{API_PREFIX}/anime")
@@ -1777,7 +1794,9 @@ def anime_detail(mal_id: int):
     )
     if anime is None:
         raise ApiError("Anime not found", 404)
-    return jsonify({"item": _serialize_anime(anime, detailed=True)})
+    payload = _serialize_anime(anime, detailed=True)
+    _attach_verified_refresh(payload, "anime", mal_id)
+    return jsonify({"item": payload})
 
 
 @app.get(f"{API_PREFIX}/catalogue")

@@ -651,7 +651,11 @@ export function responsiveFilterPanelClasses(
   ].join(" ");
 }
 
-export function formatFreshness(timestamp, now = new Date()) {
+export function formatFreshness(
+  timestamp,
+  now = new Date(),
+  label = "Latest catalogue change",
+) {
   if (!timestamp) return null;
   const updated = new Date(timestamp);
   if (Number.isNaN(updated.getTime())) return null;
@@ -659,16 +663,16 @@ export function formatFreshness(timestamp, now = new Date()) {
     0,
     Math.floor((now.getTime() - updated.getTime()) / 60_000),
   );
-  if (elapsedMinutes < 1) return "Catalogue updated just now";
+  if (elapsedMinutes < 1) return `${label} just now`;
   if (elapsedMinutes < 60) {
-    return `Catalogue updated ${elapsedMinutes} minute${elapsedMinutes === 1 ? "" : "s"} ago`;
+    return `${label} ${elapsedMinutes} minute${elapsedMinutes === 1 ? "" : "s"} ago`;
   }
   const elapsedHours = Math.floor(elapsedMinutes / 60);
   if (elapsedHours < 24) {
-    return `Catalogue updated ${elapsedHours} hour${elapsedHours === 1 ? "" : "s"} ago`;
+    return `${label} ${elapsedHours} hour${elapsedHours === 1 ? "" : "s"} ago`;
   }
   const elapsedDays = Math.floor(elapsedHours / 24);
-  return `Catalogue updated ${elapsedDays} day${elapsedDays === 1 ? "" : "s"} ago`;
+  return `${label} ${elapsedDays} day${elapsedDays === 1 ? "" : "s"} ago`;
 }
 
 export function visiblePageNumbers(currentPage, totalPages) {

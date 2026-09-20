@@ -67,31 +67,63 @@ class SyncMetrics:
     candidates_by_tier: dict = field(default_factory=dict)
     selected_by_tier: dict = field(default_factory=dict)
     deferred_by_tier: dict = field(default_factory=dict)
+    candidates_by_media_and_tier: dict = field(default_factory=dict)
+    selected_by_media_and_tier: dict = field(default_factory=dict)
+    fetched_by_media_and_tier: dict = field(default_factory=dict)
+    validated_by_media_and_tier: dict = field(default_factory=dict)
+    changed_by_media_and_tier: dict = field(default_factory=dict)
+    unchanged_by_media_and_tier: dict = field(default_factory=dict)
+    failed_by_media_and_tier: dict = field(default_factory=dict)
+    deferred_by_media_and_tier: dict = field(default_factory=dict)
+    oldest_verified_active_refresh_age_days_by_media: dict = field(
+        default_factory=dict
+    )
+    active_records_by_media: dict = field(default_factory=dict)
+    never_verified_active_by_media: dict = field(default_factory=dict)
+    estimated_runs_to_clear_due_active_by_media: dict = field(default_factory=dict)
     next_eligible_by_tier: dict = field(default_factory=dict)
     relationships_changed: int = 0
 
 
-DETAIL_TIER_ORDER = ("active", "missing", "recent", "stable", "archived", "retry")
+DETAIL_TIER_ORDER = (
+    "active",
+    "upcoming",
+    "missing",
+    "recent",
+    "stable",
+    "archived",
+    "retry",
+)
 DETAIL_TIER_WEIGHTS = {
     "active": 4,
+    "upcoming": 2,
     "missing": 2,
     "recent": 2,
     "stable": 1,
     "archived": 1,
     "retry": 1,
 }
+# Each media lane keeps most detail slots for currently airing or publishing
+# work. The remaining slots retain deterministic background progress.
+ACTIVE_SLOT_NUMERATOR = 4
+ACTIVE_SLOT_DENOMINATOR = 5
 
 
 def _normalized_status(model):
     return func.replace(
-        func.upper(func.trim(func.coalesce(model.status, ""))), " ", "_"
+        func.replace(
+            func.upper(func.trim(func.coalesce(model.status, ""))), "-", "_"
+        ),
+        " ",
+        "_",
     )
 
 
 def _detail_tier(kind, model, state, now):
     """Return a cheap SQL tier, preferring the last provider-derived tier."""
     status = _normalized_status(model)
-    dynamic = status.in_(ACTIVE_STATUSES | UPCOMING_STATUSES)
+    active = status.in_(ACTIVE_STATUSES)
+    upcoming = status.in_(UPCOMING_STATUSES)
     finished = status.in_(FINISHED_STATUSES)
     missing = or_(state.last_success_at.is_(None), status == "")
     year = Anime.year if kind == "anime" else Manga.publication_year
@@ -103,8 +135,9 @@ def _detail_tier(kind, model, state, now):
         else_="archived",
     )
     return case(
+        (active, "active"),
+        (upcoming, "upcoming"),
         (state.last_failure.is_not(None), "retry"),
-        (dynamic, "active"),
         (missing, "missing"),
         (state.refresh_tier.in_(DETAIL_TIERS), state.refresh_tier),
         else_=inferred,
@@ -155,7 +188,7 @@ def _due_statement(kind, queue, now, policy):
 
 
 def plan_details(kind, queue, limit, now, policy):
-    """Select a bounded, deterministic mix without letting retries starve titles."""
+    """Select bounded work with a hard active reserve and fair background slots."""
     statement, tier_expression = _due_statement(kind, queue, now, policy)
     due = statement.order_by(None).subquery()
     counts = {
@@ -201,23 +234,44 @@ def plan_details(kind, queue, limit, now, policy):
             for tier in DETAIL_TIER_ORDER
             if counts.get(tier)
         }
-        cycle = [
-            tier for tier in DETAIL_TIER_ORDER for _ in range(DETAIL_TIER_WEIGHTS[tier])
-        ]
-        # Rotate the allocation deterministically between scheduled windows so
-        # even unusually tiny limits cannot permanently exclude a low tier.
-        phase = (now.toordinal() // policy.airing_days) % len(cycle)
-        cycle = cycle[phase:] + cycle[:phase]
         rows = []
-        while len(rows) < limit and any(pools.values()):
+
+        active_pool = pools.get("active")
+        background_available = any(
+            pool for tier, pool in pools.items() if tier != "active"
+        )
+        active_reserve = (
+            limit * ACTIVE_SLOT_NUMERATOR + ACTIVE_SLOT_DENOMINATOR - 1
+        ) // ACTIVE_SLOT_DENOMINATOR
+        if background_available and limit > 1:
+            active_reserve = min(active_reserve, limit - 1)
+        while active_pool and len(rows) < active_reserve:
+            rows.append(active_pool.popleft())
+
+        background_cycle = [
+            tier
+            for tier in DETAIL_TIER_ORDER
+            if tier != "active"
+            for _ in range(DETAIL_TIER_WEIGHTS[tier])
+        ]
+        # Rotate background allocation between scheduled windows so tiny limits
+        # still make progress across missing, recent, stable, archived and retry.
+        phase = (now.toordinal() // policy.airing_days) % len(background_cycle)
+        background_cycle = background_cycle[phase:] + background_cycle[:phase]
+        while len(rows) < limit and any(
+            pool for tier, pool in pools.items() if tier != "active"
+        ):
             selected_this_round = False
-            for tier in cycle:
+            for tier in background_cycle:
                 pool = pools.get(tier)
                 if pool and len(rows) < limit:
                     rows.append(pool.popleft())
                     selected_this_round = True
             if not selected_this_round:
                 break
+        # Do not waste a lane's cap when its background reserve is unused.
+        while active_pool and len(rows) < limit:
+            rows.append(active_pool.popleft())
         rank = {tier: index for index, tier in enumerate(DETAIL_TIER_ORDER)}
         rows.sort(key=lambda row: (rank[row[1]], row[0]))
     selected = {tier: 0 for tier in counts}
@@ -227,6 +281,40 @@ def plan_details(kind, queue, limit, now, policy):
         work.append({"kind": kind, "queue": queue, "mal_id": mal_id, "tier": tier})
     deferred = {tier: count - selected.get(tier, 0) for tier, count in counts.items()}
     return work, counts, deferred
+
+
+def active_refresh_health(kind, now):
+    """Summarize verified freshness for genuinely active records in one query."""
+    model = Anime if kind == "anime" else Manga
+    state = JikanRefreshState
+    statement = (
+        select(
+            func.count(),
+            func.sum(case((state.last_success_at.is_(None), 1), else_=0)),
+            func.min(state.last_success_at),
+        )
+        .select_from(model)
+        .outerjoin(
+            state,
+            and_(
+                state.kind == kind,
+                state.queue == "detail",
+                state.mal_id == model.mal_id,
+            ),
+        )
+        .where(
+            model.mal_id > 0,
+            model.is_adult.is_(False),
+            _normalized_status(model).in_(ACTIVE_STATUSES),
+        )
+    )
+    if kind != "anime":
+        statement = statement.where(Manga.content_type == kind.upper())
+    total, never_verified, oldest = db.session.execute(statement).one()
+    age_days = None
+    if oldest is not None:
+        age_days = round(max(0, (now - utc(oldest)).total_seconds()) / 86400, 2)
+    return int(total or 0), int(never_verified or 0), age_days
 
 
 def plan_pages(now, page_limit, policy):
@@ -447,6 +535,10 @@ def fetch_work(client, budget, page_plans, queues, spool, metrics):
                     metrics.deferred_by_tier[tier] = (
                         metrics.deferred_by_tier.get(tier, 0) + 1
                     )
+                    _increment(
+                        metrics.deferred_by_media_and_tier,
+                        _media_tier_key(deferred_item),
+                    )
             continue
         except (JikanTemporaryError, HTTPError) as error:
             # A failed page ends only that cursor for this run. Do not advance it.
@@ -544,6 +636,14 @@ def _safe_payload(data):
     return result
 
 
+def _media_tier_key(item):
+    return f"{item['kind']}:{item.get('tier', item['queue'])}"
+
+
+def _increment(mapping, key, amount=1):
+    mapping[key] = mapping.get(key, 0) + amount
+
+
 def apply_details(items, now, policy, metrics):
     from backend.jobs import jikan_etl as anime, manga_etl as manga
 
@@ -633,6 +733,9 @@ def apply_details(items, now, policy, metrics):
             with db.session.no_autoflush:
                 for item in items:
                     data, failure = item["data"], item["failure"]
+                    metric_key = _media_tier_key(item)
+                    if data is not None:
+                        _increment(batch.fetched_by_media_and_tier, metric_key)
                     row = rows.get(
                         "anime" if item["kind"] == "anime" else "manga", {}
                     ).get(item["mal_id"])
@@ -674,6 +777,12 @@ def apply_details(items, now, policy, metrics):
                             changed = before != content_snapshot(row)
                             batch.changed += int(changed)
                             batch.unchanged += int(not changed)
+                            _increment(
+                                batch.changed_by_media_and_tier
+                                if changed
+                                else batch.unchanged_by_media_and_tier,
+                                metric_key,
+                            )
                             # Detail freshness lives in the separate queue state.
                             row.last_jikan_sync = now if changed else old_sync
                     elif failure:
@@ -687,8 +796,10 @@ def apply_details(items, now, policy, metrics):
                         batch.failure_reasons[recorded_failure] = (
                             batch.failure_reasons.get(recorded_failure, 0) + 1
                         )
+                        _increment(batch.failed_by_media_and_tier, metric_key)
                     elif row is not None:
                         batch.records_succeeded += 1
+                        _increment(batch.validated_by_media_and_tier, metric_key)
                     if (
                         item["kind"] == "anime"
                         and item["queue"] == "detail"
@@ -720,6 +831,16 @@ def apply_details(items, now, policy, metrics):
                 "relationships_changed",
             ):
                 setattr(metrics, key, getattr(metrics, key) + getattr(batch, key))
+            for key in (
+                "fetched_by_media_and_tier",
+                "validated_by_media_and_tier",
+                "changed_by_media_and_tier",
+                "unchanged_by_media_and_tier",
+                "failed_by_media_and_tier",
+            ):
+                target = getattr(metrics, key)
+                for bucket, count in getattr(batch, key).items():
+                    _increment(target, bucket, count)
             for reason, count in batch.failure_reasons.items():
                 metrics.failure_reasons[reason] = (
                     metrics.failure_reasons.get(reason, 0) + count
@@ -886,20 +1007,58 @@ def run(
                 queues[label], candidates, deferred = plan_details(
                     kind, queue, cap, now, policy
                 )
+                if queue == "detail":
+                    total, never_verified, oldest_age = active_refresh_health(
+                        kind, now
+                    )
+                    metrics.active_records_by_media[kind] = total
+                    metrics.never_verified_active_by_media[kind] = never_verified
+                    metrics.oldest_verified_active_refresh_age_days_by_media[
+                        kind
+                    ] = oldest_age
                 metrics.selected += len(queues[label])
                 metrics.deferred += sum(deferred.values())
                 for tier, count in candidates.items():
                     metrics.candidates_by_tier[tier] = (
                         metrics.candidates_by_tier.get(tier, 0) + count
                     )
+                    _increment(
+                        metrics.candidates_by_media_and_tier,
+                        f"{kind}:{tier}",
+                        count,
+                    )
                 for item in queues[label]:
                     tier = item["tier"]
                     metrics.selected_by_tier[tier] = (
                         metrics.selected_by_tier.get(tier, 0) + 1
                     )
+                    _increment(
+                        metrics.selected_by_media_and_tier,
+                        _media_tier_key(item),
+                    )
                 for tier, count in deferred.items():
                     metrics.deferred_by_tier[tier] = (
                         metrics.deferred_by_tier.get(tier, 0) + count
+                    )
+                    _increment(
+                        metrics.deferred_by_media_and_tier,
+                        f"{kind}:{tier}",
+                        count,
+                    )
+                if queue == "detail":
+                    selected_active = sum(
+                        item["tier"] == "active" for item in queues[label]
+                    )
+                    due_active = candidates.get("active", 0)
+                    estimated_runs = 0
+                    if due_active:
+                        estimated_runs = (
+                            (due_active + selected_active - 1) // selected_active
+                            if selected_active
+                            else None
+                        )
+                    metrics.estimated_runs_to_clear_due_active_by_media[kind] = (
+                        estimated_runs
                     )
             db.session.remove()
             db.engine.dispose()

@@ -895,6 +895,8 @@ describe("catalogue filter integration", () => {
                 popularity: 1,
                 members: 100,
                 synopsis: "Full details are ready.",
+                last_jikan_sync: "2026-09-01T00:00:00Z",
+                last_verified_refresh: new Date().toISOString(),
               },
             }),
           });
@@ -926,6 +928,7 @@ describe("catalogue filter integration", () => {
     resolveDetail();
     expect(await screen.findByText("Popularity rank")).toBeInTheDocument();
     expect(screen.getByText("Full details are ready.")).toBeInTheDocument();
+    expect(screen.getByText(/Details checked with Jikan/)).toBeInTheDocument();
   });
 
   test("mobile Filters reveals the responsive slider panel", async () => {

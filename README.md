@@ -289,15 +289,18 @@ Detail success remains independent of listing timestamps, so listing updates
 cannot postpone missing detail data. Existing titles without a tier are
 classified conservatively and gradually processed within the budget.
 
-Detail slots use a deterministic weighted rotation: active/upcoming titles get
-four shares, missing metadata and recently changing titles get two shares each,
-and stable, archived, and retry work get one share each. Active records are
-applied first, while the rotating allocation prevents low-volume runs from
-permanently starving old titles. Repeated failures occupy only the retry share
-and back off exponentially. Missing seasons are filled by normal detail
-responses and listings; the scheduled worker no longer makes an extra per-title
-season request. The standalone `--backfill-seasons` repair command remains
-available.
+Each Anime, Manga, and Manhwa detail lane reserves 80% of a busy run for due
+airing/publishing records. At least one slot remains for background work when a
+lane has both kinds of work. Missing, recent, stable, archived, and retry work
+and upcoming titles use a deterministic rotating weighted allocation for the
+background slots. Upcoming titles retain the same short eligibility interval,
+but cannot displace currently airing or publishing work from its reserved slots.
+Within every tier the oldest verified or attempted records are selected first,
+so the same titles cannot continually jump ahead. A failed active title remains
+in the active lane but still observes exponential retry backoff. Missing seasons
+are filled by normal detail responses and listings; the scheduled worker no
+longer makes an extra per-title season request. The standalone
+`--backfill-seasons` repair command remains available.
 
 Refresh intervals are configurable through environment variables:
 
@@ -316,7 +319,8 @@ Refresh intervals are configurable through environment variables:
 All intervals must be positive; tier intervals must stay ordered from shortest
 to longest, and the recent window must end before the archive threshold. They
 describe eligibility, not a guarantee that the next run will reach a title: the
-48-hour guard and queue budgets still apply.
+daily guard and queue budgets still apply. Each run reports the estimated number
+of runs needed to clear the active work that was due when planning occurred.
 Temporary/incomplete failures retry after 1, 2, 4, 8, then at most 14 days. A
 missing detail endpoint (404) backs off through 30, 60, 120, then 180 days. A
 successful complete response resets the failure streak. A basic-endpoint fallback
@@ -334,17 +338,21 @@ studio, streaming and author arrays clear stale links; partially malformed
 arrays remain additive. Malformed genre arrays preserve existing genres. Only
 HTTP(S) streaming URLs are saved. Scheduled writes compare business data and
 preserve an unchanged catalogue row's `last_jikan_sync`; detail freshness is
-tracked separately. Streaming-only batches do not read title descriptions or
+tracked separately in `jikan_refresh_state.last_success_at`. The detail API
+exposes that value as `last_verified_refresh`, and the UI labels it as a Jikan
+check rather than claiming the title changed. Catalogue-level freshness remains
+the latest actual catalogue change, not proof that every title was refreshed.
+Streaming-only batches do not read title descriptions or
 unrelated relationships. Author/studio/service lookups are limited to the
 incoming batch. Existing adult-only cleanup remains; no catalogue pruning is
 performed to meet a storage quota. Facets are published only after changes.
 
 A fully applied budget-limited run is successful even when work remains, and
-counts toward the 48-hour cadence. Deferred/unfetched titles are not marked
+counts toward the daily cadence. Deferred/unfetched titles are not marked
 attempted. When at least one verified page or complete record is committed,
 routine item failures (404s, exhausted temporary retries, sparse responses) and
 failed pages produce `success_with_warnings`, not a failed workflow. This counts
-toward the same 48-hour interval, preventing one unavailable title from causing
+toward the same daily interval, preventing one unavailable title from causing
 another full ETL every day. Failed items retain retry state; failed pages do not
 advance. Partial detail payloads may safely improve metadata, but do not mark
 detail freshness successful: title/status, genres and studios (Anime) or authors
@@ -376,8 +384,10 @@ Useful focused commands are:
 ## Scheduled GitHub Actions sync
 
 `.github/workflows/jikan-sync.yml` wakes once per day. A read-only GitHub Actions
-API guard starts the ETL only when at least 48 hours have passed since the last
+API guard starts the ETL when at least 22 hours have passed since the last
 scheduled run whose **Sync Anime, Manga, and Manhwa** step completed successfully.
+The 22-hour safety window accommodates normal GitHub cron jitter while the
+once-daily cron remains the only scheduled trigger.
 Successful daily runs where that step was skipped do not reset the interval. The
 guard inspects workflow jobs and steps, and fails closed without starting a
 database-writing sync if the GitHub API history cannot be verified. Manual
@@ -389,10 +399,13 @@ Run a manual sync from the repository's **Actions** page by selecting
 run inside one Python process, which preserves the shared rate limiter. The
 workflow caches only pip dependencies, keyed by requirements.txt. The step
 summary and `ETL efficiency` JSON log report HTTP attempts, successes, and
-failures by request lane; requests avoided; candidates, selections, and deferrals
-by refresh tier; selected/inserted/changed/unchanged/failed/deferred records; relationship
-changes; adult-only removals; applied/failed pages; cursor positions; projected
-next eligibility; fetch/apply seconds; and exhausted budget categories.
+failures by request lane; requests avoided; candidates, selections, fetches,
+validations, changes, failures, and deferrals by media type and refresh tier;
+selected/inserted/changed/unchanged/failed/deferred records; relationship changes;
+adult-only removals; applied/failed pages; cursor positions; oldest verified
+active refresh ages, active record totals and never-verified counts; estimated
+runs to clear due active work; projected next eligibility; fetch/apply seconds;
+and exhausted budget categories.
 `records_succeeded` counts complete record refreshes, and `failure_reasons`
 separates missing, temporary, invalid and incomplete responses.
 Record counters are phase operations, not unique title counts;

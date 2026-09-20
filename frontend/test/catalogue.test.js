@@ -658,6 +658,10 @@ test("freshness text is omitted for missing data and humanized when present", ()
   assert.equal(formatFreshness(null, now), null);
   assert.equal(
     formatFreshness("2026-07-29T14:00:00Z", now),
-    "Catalogue updated 2 hours ago",
+    "Latest catalogue change 2 hours ago",
+  );
+  assert.equal(
+    formatFreshness("2026-07-29T14:00:00Z", now, "Details checked with Jikan"),
+    "Details checked with Jikan 2 hours ago",
   );
 });
