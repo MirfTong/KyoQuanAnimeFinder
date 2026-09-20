@@ -8,7 +8,8 @@ integration target; neither a production Neon URL nor provider HTTP is used.
 
 from collections import Counter
 from contextlib import ExitStack
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from importlib import import_module
 import json
 import os
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 with patch.dict(os.environ, {"DATABASE_URL": "sqlite://"}):
     from backend import schema
     from backend.jobs import efficient_sync as worker, jikan_etl, manga_etl
+    from backend.jobs import ongoing_sync
     from backend.jobs.refresh_policy import RefreshPolicy
     from backend.models import (
         Anime,
@@ -38,7 +40,7 @@ with patch.dict(os.environ, {"DATABASE_URL": "sqlite://"}):
         Manga,
         db,
     )
-    from backend.services.jikan_client import JikanClient
+    from backend.services.jikan_client import JikanClient, JikanTemporaryError
     from tests.test_jikan_client import FakeClock, Response
 
 
@@ -173,7 +175,414 @@ class PostgreSQLETLTests(unittest.TestCase):
         self.migrate()
         self.assertEqual(self.session.scalar(text("SELECT count(*) FROM anime")), 1)
 
-    def test_version_six_upgrade_preserves_catalogue_relationships_and_cursor(self):
+    @staticmethod
+    def listing(mal_id=1, **changes):
+        return {
+            "mal_id": mal_id,
+            "status": "Currently Airing",
+            "score": 9.1,
+            "popularity": 10,
+            "members": 1000,
+            "episodes": None,
+            **changes,
+        }
+
+    def test_listing_commit_preserves_details_and_replay_is_duplicate_safe(
+        self,
+    ):
+        self.migrate()
+        self.anime(
+            synopsis="Keep this", last_jikan_sync=NOW - timedelta(days=10)
+        )
+        page = {
+            "kind": "ongoing_page",
+            "media": "anime",
+            "key": "ongoing:anime:v1",
+            "page": 1,
+            "result": {
+                "entries": [self.listing(), self.listing()],
+                "page": 1,
+                "has_next_page": True,
+            },
+        }
+        metrics = worker.SyncMetrics()
+        worker.apply_page(page, metrics)
+        row = self.session.scalar(select(Anime))
+        self.assertEqual(
+            (row.score, row.episodes, row.synopsis, row.genres_detailed),
+            (9.1, 12, "Keep this", ["Drama"]),
+        )
+        original_change = row.last_jikan_sync
+        self.assertIsNone(
+            self.session.get(JikanRefreshState, ("anime", 1, "detail"))
+        )
+        self.assertIsNotNone(
+            self.session.get(
+                JikanRefreshState, ("anime", 1, "listing")
+            ).last_success_at
+        )
+        worker.apply_page(page, metrics)
+        self.assertEqual(
+            self.session.scalar(select(Anime.last_jikan_sync)), original_change
+        )
+        self.assertEqual(
+            self.session.scalar(
+                text("SELECT count(*) FROM jikan_refresh_state")
+            ),
+            1,
+        )
+        self.assertIsNone(
+            self.session.get(JikanSyncState, "catalogue_facets_dirty")
+        )
+        self.assertIsNotNone(
+            self.session.get(JikanSyncState, "catalogue_cache_generation")
+        )
+        self.assertEqual(
+            self.session.get(JikanSyncState, page["key"]).next_page, 2
+        )
+        with patch.object(
+            self.session, "commit", side_effect=RuntimeError("interrupt")
+        ):
+            with self.assertRaises(RuntimeError):
+                worker.apply_page(
+                    {
+                        **page,
+                        "page": 2,
+                        "result": {
+                            "entries": [self.listing(score=7)],
+                            "page": 2,
+                            "has_next_page": False,
+                        },
+                    },
+                    metrics,
+                )
+        self.assertEqual(self.session.scalar(select(Anime.score)), 9.1)
+        self.assertEqual(
+            self.session.get(JikanSyncState, page["key"]).next_page, 2
+        )
+        self.assertEqual(metrics.listing_by_media["anime"]["changed"], 1)
+
+    def test_scalar_detail_and_discovery_commit_without_dirtying_facets(self):
+        self.migrate()
+        self.anime()
+        metrics = worker.SyncMetrics()
+        worker.apply_details(
+            [
+                {
+                    "kind": "anime",
+                    "queue": "detail",
+                    "mal_id": 1,
+                    "data": {"mal_id": 1, "score": 9},
+                    "failure": None,
+                }
+            ],
+            NOW,
+            RefreshPolicy(),
+            metrics,
+        )
+        self.assertIsNone(
+            self.session.get(JikanSyncState, "catalogue_facets_dirty")
+        )
+        worker.apply_page(
+            {
+                "kind": "anime_page",
+                "provider_type": "tv",
+                "key": "scalar-page",
+                "page": 1,
+                "result": {
+                    "entries": [{"mal_id": 1, "type": "TV", "score": 9.2}],
+                    "page": 1,
+                    "has_next_page": False,
+                },
+            },
+            metrics,
+        )
+        self.assertIsNone(
+            self.session.get(JikanSyncState, "catalogue_facets_dirty")
+        )
+
+    def test_listing_commit_is_visible_through_api_and_cache_generation(self):
+        self.migrate()
+        self.anime()
+        api = import_module("backend.app")
+        monitor = api.CacheGenerationMonitor()
+        with (
+            patch.object(api, "db", self.proxy),
+            patch.object(api, "cache_generation_monitor", monitor),
+        ):
+            api.response_cache.clear()
+            self.addCleanup(api.response_cache.clear)
+            client = api.app.test_client()
+            before = client.get("/api/v1/catalogue/ANIME/1")
+            self.assertEqual(before.status_code, 200)
+            self.assertEqual(before.json["item"]["score"], 8)
+            metrics = worker.SyncMetrics()
+            worker.apply_page(
+                {
+                    "kind": "ongoing_page",
+                    "media": "anime",
+                    "key": "ongoing:anime:v1",
+                    "page": 1,
+                    "result": {
+                        "entries": [self.listing()],
+                        "page": 1,
+                        "last_visible_page": 2,
+                        "has_next_page": True,
+                    },
+                },
+                metrics,
+            )
+            monitor._next_check = 0
+            after = client.get("/api/v1/catalogue/ANIME/1")
+            self.assertEqual(after.status_code, 200)
+            self.assertEqual(after.json["item"]["score"], 9.1)
+            self.assertIsNotNone(after.json["item"]["last_listing_refresh"])
+            self.assertIsNone(after.json["item"]["last_verified_refresh"])
+            self.assertEqual(
+                metrics.listing_by_media["anime"]["estimated_remaining_runs"], 1
+            )
+
+    def test_facet_repair_marker_survives_failure_and_clears_after_publication(
+        self,
+    ):
+        self.migrate()
+        self.anime()
+        worker.apply_details(
+            [
+                {
+                    "kind": "anime",
+                    "queue": "detail",
+                    "mal_id": 1,
+                    "data": {"mal_id": 1, "genres": [{"name": "Action"}]},
+                    "failure": None,
+                }
+            ],
+            NOW,
+            RefreshPolicy(),
+            worker.SyncMetrics(),
+        )
+        self.session.remove()
+        self.assertIsNotNone(
+            self.session.get(JikanSyncState, "catalogue_facets_dirty")
+        )
+        schema.refresh_catalogue_facets()
+        self.session.expire_all()
+        self.assertIsNone(
+            self.session.get(JikanSyncState, "catalogue_facets_dirty")
+        )
+
+    def test_real_entry_point_uses_listing_budget_for_all_media(self):
+        self.migrate()
+        self.anime()
+        for mal_id, kind in ((2, "MANGA"), (3, "MANHWA")):
+            self.session.add(
+                Manga(
+                    mal_id=mal_id,
+                    content_type=kind,
+                    title=kind,
+                    status="Publishing",
+                    mal_url="https://example.test",
+                    image_url="",
+                    legacy_genres=[],
+                    genres_detailed=[],
+                )
+            )
+        self.session.commit()
+
+        def respond(url):
+            if "status=airing" in url:
+                entries = [self.listing()]
+            elif "status=publishing" in url:
+                manhwa = "type=manhwa" in url
+                entries = [
+                    self.listing(
+                        3 if manhwa else 2,
+                        status="Publishing",
+                        type="Manhwa" if manhwa else "Manga",
+                        chapters=99,
+                        volumes=10,
+                    )
+                ]
+            elif "/full" in url:
+                mal_id = int(urlsplit(url).path.split("/")[-2])
+                if "/anime/" in url:
+                    return {
+                        "data": {
+                            **self.listing(mal_id),
+                            "title": "Existing",
+                            "genres": [],
+                            "studios": [],
+                            "streaming": [],
+                        }
+                    }
+                return {
+                    "data": {
+                        **self.listing(mal_id),
+                        "title": "Print",
+                        "status": "Publishing",
+                        "type": "Manga" if mal_id == 2 else "Manhwa",
+                        "authors": [],
+                        "genres": [],
+                        "chapters": 99,
+                        "volumes": 10,
+                    }
+                }
+            else:
+                entries = []
+            return {"data": entries, "pagination": {"has_next_page": False}}
+
+        requests, (metrics, budget, outcome) = self.invoke_scheduled(
+            respond, limit=20
+        )
+        self.assertEqual(
+            set(metrics.listing_by_media), {"anime", "manga", "manhwa"}
+        )
+        for kind in metrics.listing_by_media:
+            self.assertEqual(metrics.listing_by_media[kind]["committed"], 1)
+        self.assertLessEqual(budget.attempted, 200)
+        self.assertNotEqual(outcome, "failed")
+        self.assertEqual(sum("status=" in url for url in requests), 3)
+
+    def test_listing_resume_validation_and_complete_pass_wait(self):
+        self.migrate()
+        self.anime()
+        key = "ongoing:anime:v1"
+        self.session.add(JikanSyncState(key=key, next_page=8))
+        self.session.commit()
+        planned = ongoing_sync.plan(
+            self.session, "anime", 200, 10, NOW, RefreshPolicy()
+        )
+        self.assertEqual(planned["page"], 7)
+        metrics = worker.SyncMetrics()
+        bad = {
+            **planned,
+            "result": {
+                "entries": [self.listing(score="bad")],
+                "page": 7,
+                "has_next_page": True,
+            },
+        }
+        with self.assertRaises(JikanTemporaryError):
+            worker.apply_page(bad, metrics)
+        self.assertEqual(self.session.get(JikanSyncState, key).next_page, 8)
+        for failure in ("not_found", "temporary"):
+            worker.apply_page(
+                {**planned, "page": 8, "failure": failure}, metrics
+            )
+            self.assertEqual(self.session.get(JikanSyncState, key).next_page, 8)
+        worker.apply_page(
+            {
+                **planned,
+                "page": 8,
+                "result": {"entries": [], "page": 8, "has_next_page": False},
+            },
+            metrics,
+        )
+        cursor = self.session.get(JikanSyncState, key)
+        self.assertEqual(cursor.next_page, 1)
+        self.assertIsNone(
+            ongoing_sync.plan(
+                self.session,
+                "anime",
+                200,
+                10,
+                cursor.last_completed_at,
+                RefreshPolicy(),
+            )
+        )
+        self.assertEqual(
+            ongoing_sync.plan(
+                self.session,
+                "anime",
+                200,
+                10,
+                cursor.last_completed_at + timedelta(days=3),
+                RefreshPolicy(),
+            )["page"],
+            1,
+        )
+
+    def test_postgresql_queue_fairness_over_repeated_partial_runs(self):
+        self.migrate()
+        for mal_id, days in ((1, 4), (900, 20), (999, 10)):
+            row = self.anime(mal_id)
+            row.status = "CURRENTLY_AIRING"
+            self.session.add(
+                JikanRefreshState(
+                    kind="anime",
+                    mal_id=mal_id,
+                    queue="detail",
+                    last_attempt_at=NOW - timedelta(days=days),
+                    last_success_at=NOW - timedelta(days=days),
+                    next_attempt_at=NOW - timedelta(days=1),
+                )
+            )
+        self.session.commit()
+        selected = []
+        for offset in range(3):
+            now = NOW + timedelta(days=offset)
+            work, _, _ = worker.plan_details(
+                "anime", "detail", 3, now, RefreshPolicy()
+            )
+            first = work[0]
+            selected.append(first["mal_id"])
+            # Only the first request fitted in the remaining HTTP budget.
+            # Its failure advances attempt ordering but never success.
+            worker.apply_details(
+                [{**first, "data": None, "failure": "temporary"}],
+                now,
+                RefreshPolicy(),
+                worker.SyncMetrics(),
+            )
+        self.assertEqual(selected, [900, 999, 1])
+
+    def test_large_backlogs_keep_media_and_active_allocations_bounded(self):
+        self.migrate()
+        self.session.execute(
+            text("""
+            INSERT INTO anime (mal_id, title, status, is_adult, year,
+                               type, mal_url, sequel, image_url, genres, genres_detailed)
+            SELECT id, 'Fixture', CASE WHEN id > 10000
+                THEN 'CURRENTLY_AIRING' ELSE 'FINISHED_AIRING' END, false, 2000,
+                'TV', '', false, '', '{}', '{}'
+            FROM generate_series(1, 10274) AS id
+        """)
+        )
+        self.session.execute(
+            text("""
+            INSERT INTO manga (mal_id, title, content_type, status, is_adult,
+                               mal_url, image_url)
+            SELECT id, 'Fixture', CASE WHEN id <= 11000 THEN 'MANGA' ELSE 'MANHWA' END,
+                CASE WHEN id <= 8000 OR id BETWEEN 11001 AND 12572
+                THEN 'Publishing' ELSE 'Finished' END, false, '', ''
+            FROM generate_series(1, 15000) AS id
+        """)
+        )
+        self.session.commit()
+        for kind, cap, active in (
+            ("anime", 190, 274),
+            ("manga", 90, 8000),
+            ("manhwa", 90, 1572),
+        ):
+            with self.subTest(kind=kind):
+                work, candidates, deferred = worker.plan_details(
+                    kind, "detail", cap, NOW, RefreshPolicy()
+                )
+                self.assertEqual(len(work), cap)
+                self.assertTrue(all(item["kind"] == kind for item in work))
+                self.assertEqual(
+                    sum(item["tier"] == "active" for item in work), cap * 4 // 5
+                )
+                self.assertEqual(candidates["active"], active)
+                self.assertGreater(sum(deferred.values()), 1000)
+                self.assertEqual(
+                    worker.active_refresh_health(kind, NOW, "listing"),
+                    (active, active, None),
+                )
+
+    def test_version_six_upgrade_preserves_catalogue_relationships_and_cursor(
+        self,
+    ):
         # 5341b50 -> 066fa3b changed only the schema version and introduced
         # JikanRefreshState. Build the pre-refactor tables with the unchanged
         # additive migration, excluding precisely that new table.
@@ -183,7 +592,9 @@ class PostgreSQLETLTests(unittest.TestCase):
             if table.name != "jikan_refresh_state"
         ]
         old_metadata = SimpleNamespace(
-            create_all=lambda bind: db.metadata.create_all(bind, tables=old_tables)
+            create_all=lambda bind: db.metadata.create_all(
+                bind, tables=old_tables
+            )
         )
         with (
             patch.object(schema, "CATALOGUE_SCHEMA_VERSION", 6),

@@ -153,10 +153,16 @@ class AppTests(unittest.TestCase):
         verified = datetime(2026, 9, 19, 9, 30, tzinfo=timezone.utc)
         payload = {"last_jikan_sync": "2026-09-01T00:00:00+00:00"}
 
-        with patch("backend.app.db.session.scalar", return_value=verified):
+        listing = verified + timedelta(hours=2)
+        with patch("backend.app.db.session.execute") as execute:
+            execute.return_value.all.return_value = [
+                ("detail", verified),
+                ("listing", listing),
+            ]
             _attach_verified_refresh(payload, "anime", 52991)
 
         self.assertEqual(payload["last_verified_refresh"], verified.isoformat())
+        self.assertEqual(payload["last_listing_refresh"], listing.isoformat())
 
     def test_anime_list_accepts_a_season_filter(self):
         response = self.client.get("/api/v1/anime?season=winter&per_page=2")

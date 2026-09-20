@@ -897,6 +897,7 @@ describe("catalogue filter integration", () => {
                 synopsis: "Full details are ready.",
                 last_jikan_sync: "2026-09-01T00:00:00Z",
                 last_verified_refresh: new Date().toISOString(),
+                last_listing_refresh: new Date().toISOString(),
               },
             }),
           });
@@ -928,7 +929,8 @@ describe("catalogue filter integration", () => {
     resolveDetail();
     expect(await screen.findByText("Popularity rank")).toBeInTheDocument();
     expect(screen.getByText("Full details are ready.")).toBeInTheDocument();
-    expect(screen.getByText(/Details checked with Jikan/)).toBeInTheDocument();
+    expect(screen.getByText(/Details checked/)).toBeInTheDocument();
+    expect(screen.getByText(/Status and counts checked/)).toBeInTheDocument();
   });
 
   test("mobile Filters reveals the responsive slider panel", async () => {

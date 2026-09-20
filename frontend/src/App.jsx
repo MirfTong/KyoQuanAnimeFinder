@@ -518,7 +518,7 @@ function DetailModal({ item, loading, onClose }) {
   const freshness = formatFreshness(
     freshnessTimestamp,
     new Date(),
-    verifiedRefresh ? "Details checked with Jikan" : "Last catalogue change",
+    verifiedRefresh ? "Details checked" : "Last catalogue change",
   );
   const studios = contentType === "ANIME" ? namedValues(item.studios) : [];
   const authors = contentType === "ANIME"
@@ -702,6 +702,12 @@ function DetailModal({ item, loading, onClose }) {
                 title={new Date(freshnessTimestamp).toLocaleString()}
               >
                 {freshness}
+              </p>
+            )}
+            {item.last_listing_refresh && (
+              <p className="text-xs text-slate-500"
+                title={new Date(item.last_listing_refresh).toLocaleString()}>
+                {formatFreshness(item.last_listing_refresh, new Date(), "Status and counts checked")}
               </p>
             )}
             {item.mal_url && (

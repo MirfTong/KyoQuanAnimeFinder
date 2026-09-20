@@ -330,6 +330,30 @@ class JikanClient:
             last_visible_page=last_visible_page,
         )
 
+    def get_ongoing_page(self, kind: str, *, page: int = 1) -> JikanAnimePage:
+        """Read a fixed-provider, MAL-ID-ordered ongoing listing (25/page)."""
+        self._validate_page(page)
+        if kind not in {"anime", "manga", "manhwa"}:
+            raise ValueError("Unsupported ongoing media kind")
+        resource = "anime" if kind == "anime" else "manga"
+        status = "airing" if kind == "anime" else "publishing"
+        media_type = "" if kind == "anime" else f"&type={kind}"
+        payload = self._get_page_from_primary(
+            f"/{resource}?status={status}{media_type}&limit=25"
+            f"&order_by=mal_id&sort=asc&page={page}&sfw=true",
+            max_transient_retries=MAX_SEASON_TRANSIENT_RETRIES,
+            retry_network_errors=True,
+        )
+        data, pagination = self._page_data(
+            payload, description="ongoing listing", expected_page=page
+        )
+        return JikanAnimePage(
+            data,
+            page,
+            pagination["has_next_page"],
+            pagination.get("last_visible_page"),
+        )
+
     def _get(
         self,
         path: str,

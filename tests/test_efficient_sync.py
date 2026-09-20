@@ -334,7 +334,10 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(result.pages_applied, 10)
         self.assertEqual(self.session.scalar(select(Anime.title)), "Updated")
         self.assertEqual(report.call_args.args[1].avoided, 1)
-        publish.assert_called_once()
+        publish.assert_not_called()
+        self.assertIsNotNone(
+            self.session.get(JikanSyncState, "catalogue_cache_generation")
+        )
 
     def test_mixed_malformed_adult_classification_is_still_excluded(self):
         self.anime()
@@ -551,6 +554,42 @@ class PersistenceTests(unittest.TestCase):
 
         self.assertEqual((total, never, oldest_age), (2, 1, 9.0))
 
+    def test_fetch_order_preserves_oldest_attempt_even_for_high_ids(self):
+        for mal_id, days in ((1, 4), (999, 20)):
+            self.anime(mal_id, "CURRENTLY_AIRING")
+            self.state(
+                mal_id,
+                last_success_at=NOW - timedelta(days=days),
+                last_attempt_at=NOW - timedelta(days=days),
+                next_attempt_at=NOW - timedelta(days=1),
+            )
+        work, _, _ = worker.plan_details(
+            "anime", "detail", 2, NOW, RefreshPolicy()
+        )
+        self.assertEqual([row["mal_id"] for row in work], [999, 1])
+
+    def test_recent_failed_attempt_cannot_displace_long_overdue_verified_record(
+        self,
+    ):
+        self.anime(1, "CURRENTLY_AIRING")
+        self.state(
+            1,
+            last_attempt_at=NOW - timedelta(days=2),
+            next_attempt_at=NOW - timedelta(days=1),
+            last_failure="temporary",
+        )
+        self.anime(999, "CURRENTLY_AIRING")
+        self.state(
+            999,
+            last_attempt_at=NOW - timedelta(days=20),
+            last_success_at=NOW - timedelta(days=20),
+            next_attempt_at=NOW - timedelta(days=17),
+        )
+        work, _, _ = worker.plan_details(
+            "anime", "detail", 1, NOW, RefreshPolicy()
+        )
+        self.assertEqual(work[0]["mal_id"], 999)
+
     def test_listing_does_not_postpone_detail_and_newly_active_title_is_accelerated(
         self,
     ):
@@ -580,6 +619,20 @@ class PersistenceTests(unittest.TestCase):
         )
         self.assertEqual(candidates, {"missing": 1})
         self.assertEqual(work[0]["tier"], "missing")
+
+    def test_finished_title_does_not_keep_an_obsolete_active_tier(self):
+        self.anime(1, "FINISHED_AIRING")
+        self.state(
+            1,
+            refresh_tier="active",
+            last_success_at=NOW - timedelta(days=10),
+            next_attempt_at=NOW - timedelta(days=1),
+        )
+        work, _, _ = worker.plan_details(
+            "anime", "detail", 10, NOW, RefreshPolicy()
+        )
+        self.assertEqual(len(work), 1)
+        self.assertNotEqual(work[0]["tier"], "active")
 
     def test_tiny_limits_rotate_without_starving_archived_titles(self):
         for mal_id in range(1, 9):

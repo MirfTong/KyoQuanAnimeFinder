@@ -595,7 +595,12 @@ def _apply_manga_page(
     state_key: str,
     track_changes: bool = False,
 ) -> MangaPageApplyResult:
-    from backend.jobs.refresh_policy import content_snapshot
+    from backend.jobs.refresh_policy import (
+        content_snapshot,
+        facet_snapshot,
+        mark_publication,
+    )
+
     expected_content_type = MANGA_CONTENT_TYPES[provider_type]
     data_by_mal_id: dict[int, dict[str, Any]] = {}
     adult_ids: set[int] = set()
@@ -652,6 +657,7 @@ def _apply_manga_page(
         result = MangaPageApplyResult(
             skipped=len(page_result.entries) - len(data_by_mal_id)
         )
+        facets_changed = False
 
         for mal_id in adult_ids:
             manga = existing.pop(mal_id, None)
@@ -662,6 +668,11 @@ def _apply_manga_page(
         for mal_id, data in data_by_mal_id.items():
             manga = existing.get(mal_id)
             before = old_sync = None
+            before_facets = (
+                facet_snapshot(manga)
+                if track_changes and manga is not None
+                else None
+            )
             if track_changes and manga is not None:
                 before, old_sync = content_snapshot(manga), manga.last_jikan_sync
             if manga is None:
@@ -688,6 +699,7 @@ def _apply_manga_page(
             result.saved += 1
             if track_changes:
                 changed = before != content_snapshot(manga)
+                facets_changed |= before_facets != facet_snapshot(manga)
                 result.changed += int(changed)
                 if not changed:
                     manga.last_jikan_sync = old_sync
@@ -700,6 +712,11 @@ def _apply_manga_page(
         state.last_error = None
         if not page_result.has_next_page:
             state.last_completed_at = datetime.now(timezone.utc)
+        if track_changes and (result.changed or result.removed_adult):
+            mark_publication(
+                db.session,
+                facets_changed=facets_changed or bool(result.removed_adult),
+            )
         db.session.commit()
         return result
 

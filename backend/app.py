@@ -866,16 +866,27 @@ def _serialize_manga(
     return payload
 
 
-def _attach_verified_refresh(payload: dict[str, Any], kind: str, mal_id: int) -> None:
-    """Expose the last complete detail response separately from content changes."""
-    timestamp = db.session.scalar(
-        select(JikanRefreshState.last_success_at).where(
-            JikanRefreshState.kind == kind,
-            JikanRefreshState.queue == "detail",
-            JikanRefreshState.mal_id == mal_id,
-        )
+def _attach_verified_refresh(
+    payload: dict[str, Any], kind: str, mal_id: int
+) -> None:
+    """Expose independent detail/listing verification in one indexed query."""
+    timestamps = dict(
+        db.session.execute(
+            select(
+                JikanRefreshState.queue, JikanRefreshState.last_success_at
+            ).where(
+                JikanRefreshState.kind == kind,
+                JikanRefreshState.queue.in_(("detail", "listing")),
+                JikanRefreshState.mal_id == mal_id,
+            )
+        ).all()
     )
-    payload["last_verified_refresh"] = timestamp.isoformat() if timestamp else None
+    for queue, field in (
+        ("detail", "last_verified_refresh"),
+        ("listing", "last_listing_refresh"),
+    ):
+        timestamp = timestamps.get(queue)
+        payload[field] = timestamp.isoformat() if timestamp else None
 
 
 def _public_statement(model, *, preview: bool = False, detailed: bool = False):

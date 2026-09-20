@@ -175,3 +175,47 @@ def content_snapshot(row):
         ]
         links.append((relationship, sorted(values, key=repr)))
     return repr((columns, links))
+
+
+def facet_snapshot(row):
+    """Only data used to build catalogue_facet, excluding scores and link URLs."""
+    state = inspect(row)
+    values = []
+    for name in ("is_adult", "content_type", "genres_detailed"):
+        if hasattr(type(row), name) and name not in state.unloaded:
+            values.append((name, repr(getattr(row, name))))
+    for relation, entity in (
+        ("genre_links", "genre"),
+        ("studio_links", "studio"),
+        ("streaming_links", "streaming_service"),
+        ("author_links", "author"),
+    ):
+        if hasattr(type(row), relation) and relation not in state.unloaded:
+            names = sorted(
+                {
+                    getattr(link, entity).name
+                    for link in getattr(row, relation)
+                    if not inspect(link).deleted
+                    and (
+                        state.session is None
+                        or link not in state.session.deleted
+                    )
+                }
+            )
+            values.append((relation, names))
+    return repr(values)
+
+
+def mark_publication(session, *, facets_changed=False):
+    """Commit cache invalidation and durable facet repair with the changed rows."""
+    from backend.models import JikanSyncState
+
+    keys = ["catalogue_cache_generation"]
+    if facets_changed:
+        keys.append("catalogue_facets_dirty")
+    for key in keys:
+        state = session.get(JikanSyncState, key)
+        if state is None:
+            state = JikanSyncState(key=key, next_page=1)
+            session.add(state)
+        state.last_completed_at = datetime.now(timezone.utc)
