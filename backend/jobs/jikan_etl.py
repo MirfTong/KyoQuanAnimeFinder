@@ -1332,7 +1332,12 @@ def _apply_season_page(
     track_changes: bool = False,
 ) -> SeasonPageApplyResult:
     """Persist one page and its next-page cursor in the same transaction."""
-    from backend.jobs.refresh_policy import content_snapshot
+    from backend.jobs.refresh_policy import (
+        content_snapshot,
+        facet_snapshot,
+        mark_publication,
+    )
+
     data_by_mal_id: dict[int, dict[str, Any]] = {}
     hentai_ids: set[int] = set()
     for entry in page_result.entries:
@@ -1372,6 +1377,7 @@ def _apply_season_page(
         result = SeasonPageApplyResult(
             skipped=len(page_result.entries) - len(data_by_mal_id)
         )
+        facets_changed = False
 
         for mal_id in hentai_ids:
             anime = existing.pop(mal_id, None)
@@ -1382,6 +1388,11 @@ def _apply_season_page(
         for mal_id, data in data_by_mal_id.items():
             anime = existing.get(mal_id)
             before = old_sync = None
+            before_facets = (
+                facet_snapshot(anime)
+                if track_changes and anime is not None
+                else None
+            )
             if track_changes and anime is not None:
                 before, old_sync = content_snapshot(anime), anime.last_jikan_sync
             previous_season = anime.season if anime is not None else None
@@ -1404,6 +1415,7 @@ def _apply_season_page(
             result.saved += 1
             if track_changes:
                 changed = before != content_snapshot(anime)
+                facets_changed |= before_facets != facet_snapshot(anime)
                 result.changed += int(changed)
                 if not changed:
                     anime.last_jikan_sync = old_sync
@@ -1416,6 +1428,11 @@ def _apply_season_page(
         state.last_error = None
         if not page_result.has_next_page:
             state.last_completed_at = datetime.now(timezone.utc)
+        if track_changes and (result.changed or result.removed_hentai):
+            mark_publication(
+                db.session,
+                facets_changed=facets_changed or bool(result.removed_hentai),
+            )
         db.session.commit()
         return result
 

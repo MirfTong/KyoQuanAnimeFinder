@@ -262,13 +262,14 @@ Scheduled defaults (standalone focused commands keep their existing behavior):
 | --- | --- | --- |
 | `--request-budget` | 800 | Maximum actual HTTP attempts, including retries and fallbacks; minimum 40 |
 | `--page-limit` | 10 | Maximum pages per TV, Movie, OVA, ONA, Special, TV Special, Manga and Manhwa cursor |
-| `--limit` | 200 | Maximum Anime detail selections, plus 200 readable-title detail selections split between Manga and Manhwa; minimum 2 |
+| `--limit` | 200 | Anime work slots, plus 200 readable-title slots split between Manga and Manhwa; ongoing listing pages replace some detail slots (see below); minimum 2 |
 | `--streaming-limit` | 100 | Maximum due Anime without saved streaming links |
 | `--batch-size` | 25 | Maximum detail attempts applied per transaction; pages commit independently |
 
 Current season discovery has a separate ten-page cap; upcoming season discovery
-has a one-page cap. HTTP shares are reserved: 25% discovery, 30% Anime details,
-15% Manga details, 15% Manhwa details, and 15% streaming. Requests are interleaved
+has a one-page cap. HTTP shares are reserved: 25% discovery, 30% Anime,
+15% Manga, 15% Manhwa, and 15% streaming. Ongoing listings and details share
+their media's allocation. Requests are interleaved
 across queues and discovery cursors. Unused shares are not borrowed, so an outage
 or large queue cannot consume another category's allocation. Caps can mean fewer
 records are handled than selected.
@@ -295,8 +296,11 @@ lane has both kinds of work. Missing, recent, stable, archived, and retry work
 and upcoming titles use a deterministic rotating weighted allocation for the
 background slots. Upcoming titles retain the same short eligibility interval,
 but cannot displace currently airing or publishing work from its reserved slots.
-Within every tier the oldest verified or attempted records are selected first,
-so the same titles cannot continually jump ahead. A failed active title remains
+Within every tier the least recently attempted records are selected first
+(falling back to the verified time when no attempt exists). Truly unattempted
+records come first; a never-successful but repeatedly attempted record does not
+keep that privilege. This ordering is preserved through HTTP fetching, even
+when the budget stops partway through a selection. A failed active title remains
 in the active lane but still observes exponential retry backoff. Missing seasons
 are filled by normal detail responses and listings; the scheduled worker no
 longer makes an extra per-title season request. The standalone
@@ -306,7 +310,7 @@ Refresh intervals are configurable through environment variables:
 
 | Variable | Days | Applies to |
 | --- | --- | --- |
-| `ETL_AIRING_DAYS` | 3 | Airing, publishing, and upcoming titles; completed seasonal scan restart |
+| `ETL_AIRING_DAYS` | 3 | Airing, publishing, and upcoming details; completed seasonal and ongoing listing pass restart |
 | `ETL_RECENT_DAYS` | 14 | Non-final statuses and titles completed within the recent window |
 | `ETL_STABLE_DAYS` | 90 | Finished titles between the recent and archive thresholds, or with no trustworthy end date |
 | `ETL_ARCHIVED_DAYS` | 180 | Finished titles whose provider end date is at least five years old |
@@ -339,13 +343,87 @@ arrays remain additive. Malformed genre arrays preserve existing genres. Only
 HTTP(S) streaming URLs are saved. Scheduled writes compare business data and
 preserve an unchanged catalogue row's `last_jikan_sync`; detail freshness is
 tracked separately in `jikan_refresh_state.last_success_at`. The detail API
-exposes that value as `last_verified_refresh`, and the UI labels it as a Jikan
-check rather than claiming the title changed. Catalogue-level freshness remains
+exposes that value as `last_verified_refresh`, and the UI labels it as a detail
+check rather than claiming the title changed. `last_listing_refresh` is separate
+and labelled "Status and counts checked" (including score/popularity). Neither
+timestamp guarantees the upstream provider itself has fresh information.
+Catalogue-level freshness remains
 the latest actual catalogue change, not proof that every title was refreshed.
 Streaming-only batches do not read title descriptions or
 unrelated relationships. Author/studio/service lookups are limited to the
 incoming batch. Existing adult-only cleanup remains; no catalogue pruning is
-performed to meet a storage quota. Facets are published only after changes.
+performed to meet a storage quota. Scalar-only changes invalidate the catalogue
+cache without rebuilding facets. Facet-relevant changes set a durable repair
+marker in the same transaction; publication clears it only after a successful
+rebuild, so an interrupted run cannot lose the pending repair.
+
+#### Lightweight ongoing coverage
+
+The worker also requests status-filtered Anime (`airing`), Manga, and Manhwa
+(`publishing`) listings from the configured primary provider. Requests use
+`sfw=true`, 25 records per page, and ascending MAL ID ordering. Pagination stays
+on that provider: switching providers midway through a pass is unsafe.
+Each lane spends at most ten work slots, and at most 10% of its selection cap,
+on these pages. At defaults this replaces 30 individual detail selections with
+30 listing requests across the three media, potentially checking 750 records.
+The detail caps become 190 Anime, 90 Manga, and 90 Manhwa while all three listing
+lanes are eligible; the 800-attempt total cap, retries, and media shares do not
+increase. Small diagnostic lanes with fewer than ten slots remain detail-only.
+
+Only already-known, non-adult rows are updated. Validated listings can change
+status, score, popularity, members, and episode/chapter/volume counts. Missing
+required keys or malformed records reject the page; explicit null counts or
+scores preserve known values. Synopsis, relationships, and streaming data are
+untouched, and listing success never advances the full-detail clock. Unknown
+titles are counted but left to regular discovery. Full details retain their
+existing eligibility intervals to catch enrichment and transitions *out* of
+ongoing status, which disappear from status-filtered listings.
+
+Independent `ongoing:<media>:v1` cursors and `queue=listing` refresh states reuse
+the existing schema. Validated row updates, verification times, cache generation,
+and cursor progress commit atomically. A failed page, including a 404, does not
+advance the cursor or claim an empty final page. Partial scans resume next run;
+multi-page resumes overlap one boundary page to reduce misses when results
+shift. Replays are duplicate-safe. Larger shifts may still require the next
+full pass: offset pagination is not a snapshot. Completed passes wait three
+days by default before restarting.
+
+Coverage estimates, **not freshness guarantees**, with ten pages per media per
+run and nine new pages on resumed runs:
+
+| Media | Evidence / planning size | Approximate runs for one listing pass |
+| --- | --- | --- |
+| Airing Anime | 363 provider records observed September 19, 2026 | 2 |
+| Publishing Manga | 8,375 previously reported local records; 9,098 in an unfiltered provider sample | 38–41 |
+| Publishing Manhwa | 1,573 SFW provider records observed September 19, 2026 | 7 |
+
+Provider/local counts and adult filtering differ; these are sizing estimates,
+not a verified current production inventory. Cooldown, retries, provider changes,
+and incomplete budget use add time. Anime listing cycles are roughly four days
+in the no-failure daily-run case; print listing cycles can still take weeks.
+At the reserved 80% full-detail allocation (152/72/72 slots), those sizes alone
+need roughly 3/117–127/22 runs for initial full-detail coverage, assuming every
+selected request completes. **Frequent complete coverage of all publishing Manga
+is still infeasible at this budget.** The additional lightweight lane improves
+volatile-field coverage without pretending to solve that capacity gap.
+
+Logs separate `listing_by_media` page selection, fetched/committed/unchanged/
+unknown record operations, failed/deferred pages, completed passes and cursors
+from full-detail counters. Active/never-verified counts and oldest verified ages
+are planning-time snapshots for each refresh class. When the provider supplies
+its final page number, remaining-page and remaining-run estimates account for
+the overlap. Selected pages are not a known count of selected database records;
+overlap/replay counts are operations, not distinct catalogue coverage. HTTP
+attempts and retries remain reported independently.
+
+On September 19, a read-only spot check of Anime 61316 found the public site and
+configured primary full-detail endpoint both reporting score 9.11, while the
+Jikan fallback full-detail endpoint reported 9.17. A successful primary response
+does not invoke fallback, so queue improvements cannot repair stale upstream
+values. This change deliberately does not mix pagination sources or double all
+requests to compare providers. Request savings are estimates, not measured Neon
+CU or network savings; the reported 31 CU-hours has no specified measurement
+period. No post-change live ETL has been run to validate operational coverage.
 
 A fully applied budget-limited run is successful even when work remains, and
 counts toward the daily cadence. Deferred/unfetched titles are not marked

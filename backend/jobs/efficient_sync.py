@@ -8,6 +8,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
+import math
 import os
 from pathlib import Path
 from tempfile import TemporaryFile
@@ -18,6 +19,7 @@ from sqlalchemy import and_, case, func, literal, or_, select
 from sqlalchemy.orm import lazyload, load_only, selectinload
 
 from backend.app import app
+from backend.jobs import ongoing_sync
 from backend.models import (
     Anime,
     AnimeStreamingService,
@@ -31,11 +33,12 @@ from backend.models import (
 )
 from backend.jobs.refresh_policy import (
     ACTIVE_STATUSES,
-    DETAIL_TIERS,
     FINISHED_STATUSES,
     UPCOMING_STATUSES,
     RefreshPolicy,
     content_snapshot,
+    facet_snapshot,
+    mark_publication,
     next_streaming_check,
     utc,
 )
@@ -83,6 +86,7 @@ class SyncMetrics:
     estimated_runs_to_clear_due_active_by_media: dict = field(default_factory=dict)
     next_eligible_by_tier: dict = field(default_factory=dict)
     relationships_changed: int = 0
+    listing_by_media: dict = field(default_factory=dict)
 
 
 DETAIL_TIER_ORDER = (
@@ -139,7 +143,10 @@ def _detail_tier(kind, model, state, now):
         (upcoming, "upcoming"),
         (state.last_failure.is_not(None), "retry"),
         (missing, "missing"),
-        (state.refresh_tier.in_(DETAIL_TIERS), state.refresh_tier),
+        (
+            state.refresh_tier.in_(("recent", "stable", "archived")),
+            state.refresh_tier,
+        ),
         else_=inferred,
     )
 
@@ -181,8 +188,9 @@ def _due_statement(kind, queue, now, policy):
             ),
         )
     return statement.where(due).order_by(
-        state.last_success_at.asc().nulls_first(),
-        state.last_attempt_at.asc().nulls_first(),
+        func.coalesce(state.last_attempt_at, state.last_success_at)
+        .asc()
+        .nulls_first(),
         model.mal_id,
     ), tier
 
@@ -209,8 +217,11 @@ def plan_details(kind, queue, limit, now, policy):
                 .over(
                     partition_by=tier_expression,
                     order_by=(
-                        state.last_success_at.asc().nulls_first(),
-                        state.last_attempt_at.asc().nulls_first(),
+                        func.coalesce(
+                            state.last_attempt_at, state.last_success_at
+                        )
+                        .asc()
+                        .nulls_first(),
                         model.mal_id,
                     ),
                 )
@@ -273,7 +284,8 @@ def plan_details(kind, queue, limit, now, policy):
         while active_pool and len(rows) < limit:
             rows.append(active_pool.popleft())
         rank = {tier: index for index, tier in enumerate(DETAIL_TIER_ORDER)}
-        rows.sort(key=lambda row: (rank[row[1]], row[0]))
+        # Stable sort: preserve the database's age order within each tier.
+        rows.sort(key=lambda row: rank[row[1]])
     selected = {tier: 0 for tier in counts}
     work = []
     for mal_id, tier in rows:
@@ -283,7 +295,7 @@ def plan_details(kind, queue, limit, now, policy):
     return work, counts, deferred
 
 
-def active_refresh_health(kind, now):
+def active_refresh_health(kind, now, queue="detail"):
     """Summarize verified freshness for genuinely active records in one query."""
     model = Anime if kind == "anime" else Manga
     state = JikanRefreshState
@@ -298,7 +310,7 @@ def active_refresh_health(kind, now):
             state,
             and_(
                 state.kind == kind,
-                state.queue == "detail",
+                state.queue == queue,
                 state.mal_id == model.mal_id,
             ),
         )
@@ -460,7 +472,7 @@ def fetch_work(client, budget, page_plans, queues, spool, metrics):
     """Round-robin each lane; unused shares are deliberately not borrowed."""
     lanes = deque()
     for plan in page_plans:
-        lanes.append(("discovery", deque([dict(plan)])))
+        lanes.append((plan.get("media", "discovery"), deque([dict(plan)])))
     for kind in ("anime", "manga", "manhwa"):
         lanes.append(("anime" if kind == "anime" else kind, deque(queues[kind])))
     lanes.append(("streaming", deque(queues["streaming"])))
@@ -487,7 +499,12 @@ def fetch_work(client, budget, page_plans, queues, spool, metrics):
             continue
         try:
             if is_page:
-                if item["kind"] == "season":
+                if item["kind"] == "ongoing_page":
+                    page = client.get_ongoing_page(
+                        item["media"], page=item["page"]
+                    )
+                    ongoing_sync.validate_listing(item["media"], page.entries)
+                elif item["kind"] == "season":
                     page = client.get_season_page(
                         item["year"], item["season"], page=item["page"]
                     )
@@ -527,7 +544,10 @@ def fetch_work(client, budget, page_plans, queues, spool, metrics):
                     streaming_from_detail[item["mal_id"]] = data
             spool.write(json.dumps(record) + "\n")
         except RequestBudgetExhausted:
-            if not is_page:
+            if is_page and item["kind"] == "ongoing_page":
+                counts = metrics.listing_by_media.setdefault(item["media"], {})
+                _increment(counts, "pages_deferred", item["cap"])
+            elif not is_page:
                 deferred_items = [item, *pending]
                 metrics.deferred += len(deferred_items)
                 for deferred_item in deferred_items:
@@ -730,6 +750,7 @@ def apply_details(items, now, policy, metrics):
             stats = anime.AnimeAssociationStats()
             author_stats = manga.AuthorSyncStats()
             batch = SyncMetrics()
+            facets_changed = False
             with db.session.no_autoflush:
                 for item in items:
                     data, failure = item["data"], item["failure"]
@@ -742,6 +763,7 @@ def apply_details(items, now, policy, metrics):
                     if data is not None and row is not None:
                         data = _safe_payload(data)
                         before = content_snapshot(row)
+                        before_facets = facet_snapshot(row)
                         old_sync = row.last_jikan_sync
                         if anime._is_hentai(data) or (
                             item["kind"] != "anime"
@@ -785,6 +807,9 @@ def apply_details(items, now, policy, metrics):
                             )
                             # Detail freshness lives in the separate queue state.
                             row.last_jikan_sync = now if changed else old_sync
+                            facets_changed |= before_facets != facet_snapshot(
+                                row
+                            )
                     elif failure:
                         batch.failed += 1
                     recorded_failure = record_attempt(
@@ -809,6 +834,11 @@ def apply_details(items, now, policy, metrics):
                         record_attempt(
                             {**item, "queue": "streaming"}, data, None, now, policy
                         )
+            if batch.changed or batch.removed:
+                mark_publication(
+                    db.session,
+                    facets_changed=facets_changed or bool(batch.removed),
+                )
             db.session.commit()
             batch.relationships_changed = sum(
                 (
@@ -857,6 +887,57 @@ def apply_page(item, metrics):
         JikanMangaPage,
         JikanSeasonPage,
     )
+
+    if item["kind"] == "ongoing_page":
+        with app.app_context():
+            counts = metrics.listing_by_media.setdefault(item["media"], {})
+            if "failure" in item:
+                # Keep the exact failed page; an empty terminal page is the only
+                # evidence allowing a shrinking listing to complete its pass.
+                anime._record_page_error(
+                    item["key"], item["page"], RuntimeError(item["failure"])
+                )
+                metrics.pages_failed += 1
+                _increment(counts, "pages_failed")
+                _increment(
+                    metrics.failure_reasons, "listing_" + item["failure"]
+                )
+                metrics.cursors[item["key"]] = item["page"]
+                return
+            try:
+                result = ongoing_sync.apply(
+                    db.session, item, datetime.now(timezone.utc)
+                )
+                if result["changed"]:
+                    mark_publication(db.session)
+                db.session.commit()
+            except BaseException:
+                db.session.rollback()
+                raise
+            for key in (
+                "fetched",
+                "committed",
+                "changed",
+                "unchanged",
+                "unknown",
+            ):
+                _increment(counts, key, result[key])
+            _increment(counts, "pages_applied")
+            last_page = item["result"].get("last_visible_page")
+            if last_page is not None:
+                remaining = max(0, last_page - item["result"]["page"])
+                counts["remaining_provider_pages"] = remaining
+                pages_per_run = counts.get("pages_selected", 1)
+                counts["estimated_remaining_runs"] = math.ceil(
+                    remaining / max(1, pages_per_run - 1)
+                )
+            if result["next_page"] == 1:
+                _increment(counts, "passes_completed")
+            metrics.pages_applied += 1
+            metrics.changed += result["changed"]
+            metrics.unchanged += result["unchanged"]
+            metrics.cursors[item["key"]] = result["next_page"]
+            return
 
     if "failure" in item:
         # Preserve existing recovery for a provider catalogue that shrank.
@@ -1004,6 +1085,29 @@ def run(
                 ("manhwa", "detail", limit // 2, "manhwa"),
                 ("anime", "streaming", streaming_limit, "streaming"),
             ):
+                if queue == "detail":
+                    total, never, age = active_refresh_health(
+                        kind, now, "listing"
+                    )
+                    metrics.listing_by_media[kind] = {
+                        "active_records": total,
+                        "never_verified": never,
+                        "oldest_verified_age_days": age,
+                        "pages_selected": 0,
+                    }
+                    listing = ongoing_sync.plan(
+                        db.session, kind, cap, page_limit, now, policy
+                    )
+                    if listing:
+                        pages.append(listing)
+                        cap -= listing["cap"]
+                        metrics.cursors[listing["key"]] = listing["page"]
+                        metrics.listing_by_media[kind].update(
+                            {
+                                "pages_selected": listing["cap"],
+                                "start_page": listing["page"],
+                            }
+                        )
                 queues[label], candidates, deferred = plan_details(
                     kind, queue, cap, now, policy
                 )
@@ -1088,7 +1192,13 @@ def run(
                 apply_details(pending, now, policy, metrics)
         # Retain established adult-only cleanup; never prune to meet a size quota.
         metrics.removed += anime.remove_hentai_anime() + manga.remove_adult_manga()
-        if metrics.changed or metrics.removed:
+        with app.app_context():
+            dirty_facets = (
+                db.session.get(JikanSyncState, "catalogue_facets_dirty")
+                is not None
+            )
+            db.session.remove()
+        if dirty_facets or metrics.removed:
             anime._refresh_and_report_catalogue_facets()
         recoverable_failures = metrics.failed or metrics.pages_failed
         verified_progress = metrics.pages_applied or metrics.records_succeeded

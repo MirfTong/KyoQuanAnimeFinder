@@ -131,6 +131,11 @@ def refresh_catalogue_facets(*, commit: bool = True) -> int:
     total = int(
         db.session.scalar(text("SELECT COUNT(*) FROM catalogue_facet")) or 0
     )
+    db.session.execute(
+        text(
+            "DELETE FROM jikan_sync_state WHERE key = 'catalogue_facets_dirty'"
+        )
+    )
     # Web workers use this shared generation timestamp to invalidate their
     # process-local response caches after an ETL process rebuilds the facets.
     db.session.execute(
